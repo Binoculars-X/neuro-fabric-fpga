@@ -1,0 +1,33 @@
+# Vivado journal / log
+*.jou
+*.log
+*.str
+*.mif
+
+# Vivado generated project artifacts
+.Xil/
+vivado*.jou
+vivado*.log
+
+# Simulation work libraries
+xsim.dir/
+webtalk/
+webtalk_*.tcl
+
+# Bitstream / implementation outputs
+*.bit
+*.bin
+*.ltx
+
+# Vivado project generated folders
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.gen/
+runs/
+
+# Backup files
+*.bak
+*.swp
+*~
