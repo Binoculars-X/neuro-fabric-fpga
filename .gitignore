@@ -31,3 +31,6 @@ runs/
 *.bak
 *.swp
 *~
+
+# Visual Studio
+.vs/
