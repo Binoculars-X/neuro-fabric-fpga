@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b, 6a complete and passing XSim; next: step 6b (adam_core)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b, 6a, 6b complete and passing XSim (26/26 tests); next: step 7 (full transformer integration)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -256,7 +256,7 @@ C# reference: `AdamBF16WeightsAttentionCore.ApplyUpdate()` called directly for e
 | Module | Purpose | Status |
 |---|---|---|
 | `adam_cell.sv` | Scalar Adam: wires fp32_div × 3, fp32_sqrt × 1, BF16 encode/decode | ✅ done |
-| `adam_core.sv` | Matrix Adam: iterates `adam_cell` over R×C params per step | ⏳ |
+| `adam_core.sv` | Matrix Adam: iterates `adam_cell` over R×C params per step | ✅ done |
 
 ### 7. Full Transformer (integration)
 - Stack N layers; wire residual connections; add embedding + unembedding
