@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b complete and passing XSim; implementing step 5 (layernorm)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b complete and passing XSim; next: step 6 (Adam optimiser)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -156,8 +156,8 @@ C# reference for `fp32_sqrt.sv`: add `ExpLutHelper.RecipSqrt(float x)` — same 
 
 | Module | Purpose | Status |
 |---|---|---|
-| `fp32_sqrt.sv` | `1/√x` via Newton–Raphson, combinatorial, matches synthesized FP | ⏳ next |
-| `layernorm.sv` | Mean + variance reduction, scale/shift; instantiates `fp32_sqrt` | ⏳ |
+| `fp32_sqrt.sv` | `1/√x` via Newton–Raphson, combinatorial, matches synthesized FP | ✅ done |
+| `layernorm.sv` | Mean + variance reduction, scale/shift; instantiates `fp32_sqrt` | ✅ done |
 
 #### Sub-steps
 
