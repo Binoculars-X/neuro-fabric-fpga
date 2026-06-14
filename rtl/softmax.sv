@@ -1,7 +1,7 @@
-// Per-row FP32 softmax with causal mask — forward pass for scaled dot-product attention
+// Per-row FP32 softmax with causal mask -- forward pass for scaled dot-product attention
 //
 // Algorithm (matches AttentionCore.Softmax + ExpLutHelper with LUT-256):
-//   For row i (0-based), positions j > i are causal-masked (score → -∞)
+//   For row i (0-based), positions j > i are causal-masked (score -> -inf)
 //   1. Apply mask: masked positions set to NEG_INF
 //   2. Find max over all T positions (masked positions don't affect max)
 //   3. Subtract max from each score (keeps numerics stable)
@@ -10,25 +10,25 @@
 //   6. fp32_div normalises each exp value by sum
 //
 // Pipeline:
-//   IDLE → FIND_MAX (1 cycle) → EXP_FEED (T cycles) →
-//   EXP_COLLECT (T cycles, collecting valid_out from exp_lut) →
-//   SUM_DIV (1 cycle) → OUTPUT_VALID (1 cycle, valid_out=1) → IDLE
+//   IDLE -> FIND_MAX (1 cycle) -> EXP_FEED (T cycles) ->
+//   EXP_COLLECT (T cycles, collecting valid_out from exp_lut) ->
+//   SUM_DIV (1 cycle) -> OUTPUT_VALID (1 cycle, valid_out=1) -> IDLE
 //
 //   Total latency from start pulse: 2 + 2*T + EXP_LAT cycles
 //   For T=4, EXP_LAT=4: 2 + 8 + 4 = 14 cycles
-//   Note: first exp output arrives exactly when EXP_COLLECT begins (EXP_LAT == T)
+//   Note: first exp output arrives when EXP_COLLECT begins (EXP_LAT == T)
 //
 // Interface:
-//   scores_in  — T packed FP32 scores, valid on the start cycle
-//   row_idx    — 0-based row index (used to compute causal mask)
-//   start      — 1-cycle pulse to begin processing
-//   probs_out  — T packed FP32 probabilities (valid when valid_out=1)
-//   valid_out  — 1-cycle pulse when probs_out is ready
+//   scores_in  -- T packed FP32 scores, valid on the start cycle
+//   row_idx    -- 0-based row index (used to compute causal mask)
+//   start      -- 1-cycle pulse to begin processing
+//   probs_out  -- T packed FP32 probabilities (valid when valid_out=1)
+//   valid_out  -- 1-cycle pulse when probs_out is ready
 //
 // Sub-modules instantiated:
-//   exp_lut      — per-element exp (serialised, 1 element per cycle)
-//   fp32_add_tree — reduction sum over T exp values
-//   fp32_div (×T) — normalise each exp value by sum
+//   exp_lut       -- per-element exp (serialised, 1 element per cycle)
+//   fp32_add_tree -- reduction sum over T exp values
+//   fp32_div (xT) -- normalise each exp value by sum
 //
 // Parameters:
 //   T        — sequence length (4)

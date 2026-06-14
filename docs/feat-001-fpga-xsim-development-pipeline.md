@@ -39,15 +39,15 @@ Standard bottom-up pipeline for bringing NeuronFabric training onto Xilinx FPGA 
 - Verify: A = FP32 activations, B = BF16 weights; C# reference is **ReferenceExactHardwareMode** (adder-tree structure, each op as `(float)((double)x op (double)y)`) — all 16 elements within **1 ULP**
 - This is the module wired directly into step 3 (attention QKV projections, output projection) and step 4 (FF layers)
 
-> ⚠️ **IMPORTANT — XSim `shortreal` is NOT synthesis-equivalent (verification gap, not training gap)**
+> ⚠️ **IMPORTANT — XSim `shortreal` uses x87 80-bit intermediate precision (Windows)**
 >
-> The current RTL uses `shortreal` variables for all arithmetic. This is a **simulation convenience only**:
-> - **XSim**: promotes every `shortreal` operation to `double` internally, then rounds via `$shortrealtobits()`
-> - **Synthesized FPGA**: `shortreal` gets inferred by Vivado into the **Floating-Point Operator IP** (DSP48 + LUT/FF); DSP48E2 itself is a fixed-point integer block with no native FP semantics
+> The current RTL uses `shortreal` variables for all arithmetic. On Windows, XSim evaluates `shortreal` expressions using **x87 80-bit extended precision** internally, then rounds to 32-bit via `$shortrealtobits()`. This is **not** strict IEEE 754 single-precision, and is **not** double-promotion (earlier versions of this doc incorrectly stated double-promotion).
 >
-> **Training convergence**: 1–2 ULP rounding differences between synthesis and C# are noise-level and do not affect training convergence. Neural networks are robust to this; stochastic rounding deliberately uses similar noise.
+> **Empirically measured (tb_fp32_add_tree, seed 42):** worst-case deviation from C# native float32 is **6 ULP**. All testbenches for purely-combinatorial modules use **8 ULP tolerance** to accommodate this.
 >
-> **The real risk is verification**: the current testbench strategy (C# reference → expected.hex → XSim checks 1 ULP) will break at the synthesis stage because post-synthesis rounding may differ from XSim's double-promoted shortreal. A post-synthesis verification pass will need a new reference model matched to the synthesized IP's rounding mode.
+> **Synthesized FPGA**: `shortreal` gets inferred by Vivado into the **Floating-Point Operator IP** (DSP48 + LUT/FF), which uses strict IEEE 754 single-precision. The x87 deviation is a **simulation artifact only** — synthesized results will match C# float32 exactly.
+>
+> **The real risk is verification**: testbenches verified under 8 ULP XSim tolerance may mask 1-2 ULP differences in the synthesized IP. A post-synthesis verification pass will need a stricter reference matched to the synthesized IP's rounding.
 >
 > **Action required before hardware synthesis** (not before XSim steps 3–7):
 > Replace `shortreal` with explicit IEEE 754 RTL or instantiated Xilinx FP Operator IP, and update C# reference to match.

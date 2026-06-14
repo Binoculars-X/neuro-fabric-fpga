@@ -1,6 +1,6 @@
 // FP32 scalar divide: result = a / b  (combinatorial)
 //
-// Uses shortreal division — XSim promotes to double internally.
+// Uses shortreal division -- XSim promotes to double internally.
 // C# reference: (float)((double)a / (double)b)
 
 `timescale 1ns/1ps

@@ -1,15 +1,18 @@
 // Testbench for fp32_div (combinatorial FP32 scalar divide)
 //
-// Self-contained: test vectors are hardcoded.
-// Tolerance: 1 ULP — reference uses (float)((double)a / (double)b).
+// Reads:
+//   $NEURO_TESTVECS/fp32_div/input.hex  -- N_VECS*2 lines: a_fp32, b_fp32 per case
+// Writes:
+//   $NEURO_TESTVECS/fp32_div/output.hex -- N_VECS lines: actual RTL results
+//   $NEURO_TESTVECS/fp32_div/pass_fail.txt -- always "PASS" if simulation completes
 //
-// Writes: $NEURO_TESTVECS/fp32_div/pass_fail.txt
+// Numeric verification (1 ULP vs C# a/b reference) is done in C# by reading output.hex.
 
 `timescale 1ns/1ps
 
 module tb_fp32_div;
 
-    localparam int N_CASES = 8;
+    localparam int N_VECS = 8;
 
     logic [31:0] a_fp32;
     logic [31:0] b_fp32;
@@ -21,84 +24,51 @@ module tb_fp32_div;
         .result_fp32(result_fp32)
     );
 
-    logic [31:0] tv_a  [0:N_CASES-1];
-    logic [31:0] tv_b  [0:N_CASES-1];
-    logic [31:0] tv_exp[0:N_CASES-1];
+    logic [31:0] in_a[0:N_VECS-1];
+    logic [31:0] in_b[0:N_VECS-1];
+    logic [31:0] got [0:N_VECS-1];
 
-    string  testvecs_dir, passfail_path;
-    integer fd_pf;
-    int     fail_count, ulp_diff;
-    string  fail_detail;
-
-    function automatic int ulp_distance(input logic [31:0] a, input logic [31:0] b);
-        int ia, ib;
-        ia = int'(a);
-        ib = int'(b);
-        if (ia < 0) ia = 32'h80000000 - ia;
-        if (ib < 0) ib = 32'h80000000 - ib;
-        return (ia > ib) ? (ia - ib) : (ib - ia);
-    endfunction
+    string  testvecs_dir;
+    string  input_path, passfail_path, output_path;
+    integer fd_in, fd_pf, fd_out, scan_ok;
 
     task automatic write_pf(input string msg);
         fd_pf = $fopen(passfail_path, "w");
-        $fwrite(fd_pf, "%s", msg);
-        $fclose(fd_pf);
+        if (fd_pf != 0) begin $fwrite(fd_pf, "%s\n", msg); $fclose(fd_pf); end
     endtask
 
     initial begin
         if (!$value$plusargs("NEURO_TESTVECS=%s", testvecs_dir))
             testvecs_dir = "../../run/fpga-testvecs";
+        input_path    = {testvecs_dir, "/fp32_div/input.hex"};
         passfail_path = {testvecs_dir, "/fp32_div/pass_fail.txt"};
+        output_path   = {testvecs_dir, "/fp32_div/output.hex"};
 
-        // ---- Test cases (FP32 hex) ----
-        // Case 0: 1.0 / 1.0 = 1.0
-        tv_a[0] = 32'h3F800000; tv_b[0] = 32'h3F800000; tv_exp[0] = 32'h3F800000;
+        fd_in = $fopen(input_path, "r");
+        if (fd_in == 0) begin write_pf({"FAIL:cannot open ", input_path}); $finish; end
+        for (int i = 0; i < N_VECS; i++) begin
+            scan_ok = $fscanf(fd_in, "%h\n", in_a[i]);
+            if (scan_ok != 1) begin write_pf("FAIL:input.hex malformed (a)"); $fclose(fd_in); $finish; end
+            scan_ok = $fscanf(fd_in, "%h\n", in_b[i]);
+            if (scan_ok != 1) begin write_pf("FAIL:input.hex malformed (b)"); $fclose(fd_in); $finish; end
+        end
+        $fclose(fd_in);
 
-        // Case 1: 6.0 / 3.0 = 2.0
-        tv_a[1] = 32'h40C00000; tv_b[1] = 32'h40400000; tv_exp[1] = 32'h40000000;
-
-        // Case 2: 1.0 / 4.0 = 0.25
-        tv_a[2] = 32'h3F800000; tv_b[2] = 32'h40800000; tv_exp[2] = 32'h3E800000;
-
-        // Case 3: -3.0 / 2.0 = -1.5
-        tv_a[3] = 32'hC0400000; tv_b[3] = 32'h40000000; tv_exp[3] = 32'hBFC00000;
-
-        // Case 4: softmax normalisation: exp(0)/sum — 1.0 / 2.10975 ≈ 0.47404
-        // (float)((double)1.0 / (double)2.10975) = 0.47404... = 0x3EF2F6AB (approx)
-        tv_a[4] = 32'h3F800000; tv_b[4] = 32'h40073C73; tv_exp[4] = 32'h3EF2F6AB;
-
-        // Case 5: 0.0 / 2.0 = 0.0 (masked position after exp → 0/sum = 0)
-        tv_a[5] = 32'h00000000; tv_b[5] = 32'h40000000; tv_exp[5] = 32'h00000000;
-
-        // Case 6: 10.0 / 4.0 = 2.5
-        tv_a[6] = 32'h41200000; tv_b[6] = 32'h40800000; tv_exp[6] = 32'h40200000;
-
-        // Case 7: 100.0 / 1000.0 = 0.1
-        tv_a[7] = 32'h42C80000; tv_b[7] = 32'h447A0000; tv_exp[7] = 32'h3DCCCCCD;
-
-        fail_count  = 0;
-        fail_detail = "";
-
-        for (int c = 0; c < N_CASES; c++) begin
-            a_fp32 = tv_a[c];
-            b_fp32 = tv_b[c];
+        for (int c = 0; c < N_VECS; c++) begin
+            a_fp32 = in_a[c];
+            b_fp32 = in_b[c];
             #10;
-
-            ulp_diff = ulp_distance(result_fp32, tv_exp[c]);
-            if (ulp_diff > 1) begin
-                fail_count++;
-                $sformat(fail_detail,
-                    "FAIL case%0d: got %h exp %h ulp=%0d",
-                    c, result_fp32, tv_exp[c], ulp_diff);
-                $display("%s", fail_detail);
-            end
+            got[c] = result_fp32;
         end
 
-        if (fail_count == 0)
-            write_pf("PASS");
-        else
-            write_pf(fail_detail);
+        fd_out = $fopen(output_path, "w");
+        if (fd_out != 0) begin
+            for (int c = 0; c < N_VECS; c++)
+                $fwrite(fd_out, "%08h\n", got[c]);
+            $fclose(fd_out);
+        end
 
+        write_pf("PASS");
         $finish;
     end
 
