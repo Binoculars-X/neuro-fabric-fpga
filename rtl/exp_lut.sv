@@ -117,7 +117,9 @@ module exp_lut #(
         end else if (en) begin
             tmp_sr_x = $bitstoshortreal(x_fp32);
             s1_y    <= tmp_sr_x * sr_log2e;
-            s1_nan  <= (x_fp32[30:23] == 8'hFF) && (x_fp32[22:0] != 0);
+            // NaN (exp=FF, frac!=0) or negative infinity (exp=FF, frac=0, sign=1) → output 0
+            // Note: int'($floor(real'(-inf))) = 0 in XSim, so -inf must be caught explicitly.
+            s1_nan  <= (x_fp32[30:23] == 8'hFF) && ((x_fp32[22:0] != 0) || x_fp32[31]);
             s1_v    <= valid_in;
         end
     end

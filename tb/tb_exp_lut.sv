@@ -17,7 +17,7 @@
 module tb_exp_lut;
 
     localparam int LATENCY   = 4;
-    localparam int N_VECTORS = 32;
+    localparam int N_VECTORS = 33;
     localparam int LUT_SIZE  = 256;
 
     // ------------------------------------------------------------------

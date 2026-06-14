@@ -4,8 +4,9 @@
 //   Stage 1: s01 = in[0]+in[1],  s23 = in[2]+in[3]
 //   Stage 2: sum = s01 + s23
 //
-// XSim note: shortreal arithmetic uses true IEEE 754 single precision.
-// C# reference: s01=v0+v1; s23=v2+v3; sum=s01+s23  (native float32)
+// XSim note: shortreal arithmetic is promoted to double internally by XSim;
+// $shortrealtobits() truncates back to IEEE 754 single precision.
+// C# reference: use (float)((double)a + (double)b) at each stage to match exactly.
 //
 // Parameter: T must be 4 for this implementation.
 
