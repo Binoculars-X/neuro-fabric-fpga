@@ -29,15 +29,28 @@ Standard bottom-up pipeline for bringing NeuronFabric training onto Xilinx FPGA 
 - Tiled MatMul built from BF16 MACs: C[M×N] = A[M×K] · B[K×N], both operands BF16
 - K×N parallel `bf16_mac` units (c_fp32=0: pure product) + FP32 adder tree
 - K=4 adder tree: `(p0+p1) + (p2+p3)` — 2 pipeline stages; total latency = MAC_LATENCY + 2
-- Verify: 4×4×4 random BF16 matrices, C# reference uses sequential accumulation matching `AttentionCore.MatMul()` — all 16 elements within 16 ULP (RTL adder tree vs sequential differs by ≤ 16 ULP for K=4)
+- Verify: 4×4×4 random BF16 matrices, C# reference uses **ReferenceExactHardwareMode** (`(float)((double)x op (double)y)` per operation, matching XSim shortreal→double promotion) — all 16 elements within **1 ULP**
 - Note: models **both operands BF16** — useful for fully-quantized inference but NOT the bf16w training path (activations are always FP32)
 
 ### 2b. Matrix multiplication (FP32×BF16 — bf16w training path)
 - Same adder tree as step 2, but `a_fp32 [31:0]` replaces `a_bf16 [15:0]`
 - Maps to `AdamBF16WeightsAttentionCore` forward pass: weights stored BF16, decoded on-the-fly; activations always FP32
 - `bf16_mac` needs a new `FP32×BF16` variant (or mixed-input port): decode B from BF16, multiply as FP32×FP32
-- Verify: A = FP32 activations (e.g. layer output), B = BF16 weights (encoded from C# weight matrix); C# reference is exact sequential accumulation matching `AttentionCore.MatMul()` (no override in `AdamBF16WeightsAttentionCore`) — all 16 elements within 16 ULP
+- Verify: A = FP32 activations, B = BF16 weights; C# reference is **ReferenceExactHardwareMode** (adder-tree structure, each op as `(float)((double)x op (double)y)`) — all 16 elements within **1 ULP**
 - This is the module wired directly into step 3 (attention QKV projections, output projection) and step 4 (FF layers)
+
+> ⚠️ **IMPORTANT — XSim `shortreal` is NOT synthesis-equivalent (verification gap, not training gap)**
+>
+> The current RTL uses `shortreal` variables for all arithmetic. This is a **simulation convenience only**:
+> - **XSim**: promotes every `shortreal` operation to `double` internally, then rounds via `$shortrealtobits()`
+> - **Synthesized FPGA**: `shortreal` gets inferred by Vivado into the **Floating-Point Operator IP** (DSP48 + LUT/FF); DSP48E2 itself is a fixed-point integer block with no native FP semantics
+>
+> **Training convergence**: 1–2 ULP rounding differences between synthesis and C# are noise-level and do not affect training convergence. Neural networks are robust to this; stochastic rounding deliberately uses similar noise.
+>
+> **The real risk is verification**: the current testbench strategy (C# reference → expected.hex → XSim checks 1 ULP) will break at the synthesis stage because post-synthesis rounding may differ from XSim's double-promoted shortreal. A post-synthesis verification pass will need a new reference model matched to the synthesized IP's rounding mode.
+>
+> **Action required before hardware synthesis** (not before XSim steps 3–7):
+> Replace `shortreal` with explicit IEEE 754 RTL or instantiated Xilinx FP Operator IP, and update C# reference to match.
 
 ### 3. Attention
 - QKV projection → scores → softmax (exp LUT-256, `2^n·2^f`) → weighted sum

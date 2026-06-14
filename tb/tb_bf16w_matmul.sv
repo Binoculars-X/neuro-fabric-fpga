@@ -10,7 +10,8 @@
 // Writes:
 //   $NEURO_TESTVECS/bf16w_matmul/pass_fail.txt
 //
-// Comparison: 16-ULP tolerance (XSim shortreal→double promotion).
+// Comparison: 1-ULP tolerance. C# reference uses ReferenceExactHardwareMode:
+// every operation is (float)((double)x op (double)y), matching XSim shortreal promotion.
 // Parameters: M=4, K=4, N=4, MAC_LATENCY=3, TOTAL_LAT=5.
 
 `timescale 1ns/1ps
@@ -151,7 +152,7 @@ module tb_bf16w_matmul;
         for (int ii = 0; ii < M*N; ii++) begin
             ulp_diff = int'(got_c[ii]) - int'(exp_c[ii]);
             if (ulp_diff < 0) ulp_diff = -ulp_diff;
-            if (ulp_diff > 16) begin
+            if (ulp_diff > 1) begin
                 fail_count++;
                 if (fail_count == 1)
                     $sformat(fail_detail, "C[%0d] got %08h exp %08h (diff %0d ULP)",
@@ -162,7 +163,7 @@ module tb_bf16w_matmul;
         end
 
         if (fail_count == 0) begin
-            $display("PASS — all %0d C elements within 16 ULP", M*N);
+            $display("PASS — all %0d C elements within 1 ULP", M*N);
             write_pf("PASS");
         end else begin
             $display("FAIL — %0d mismatches; first: %s", fail_count, fail_detail);
