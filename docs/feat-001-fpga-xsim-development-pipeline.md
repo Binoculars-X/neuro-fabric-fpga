@@ -52,10 +52,38 @@ Standard bottom-up pipeline for bringing NeuronFabric training onto Xilinx FPGA 
 > **Action required before hardware synthesis** (not before XSim steps 3–7):
 > Replace `shortreal` with explicit IEEE 754 RTL or instantiated Xilinx FP Operator IP, and update C# reference to match.
 
-### 3. Attention
-- QKV projection → scores → softmax (exp LUT-256, `2^n·2^f`) → weighted sum
-- Verify: forward pass logits match `AttentionCore` C# reference
-- Key: exp LUT table fits in BRAM; test LUT read latency vs pipelined MAC
+### 3. Attention sub-modules (modular build-up before integration)
+
+Step 3 is broken into independent sub-modules, each verified standalone before wiring into `attention_core.sv`.
+
+#### 3a. FP32×FP32 matrix multiply (`fp32_matmul.sv`)
+- C[M×N] = A[M×K] · B[K×N], both operands FP32 activations (no weights)
+- Used for: Q×Kᵀ score matrix (T×d × d×T), attention-weighted sum (T×T × T×d)
+- Architecture: K×N `shortreal` multiply units + 2-stage FP32 adder tree (identical structure to `bf16w_matmul`)
+- Verify: 4×4×4 random FP32 matrices, C# **ReferenceExactHardwareMode** — all 16 elements within 1 ULP
+
+#### 3b. FP32 softmax row (`softmax.sv`)
+- Input: T FP32 scores; output: T FP32 probabilities
+- Causal mask applied before exp: scores at masked positions set to −∞ → exp → 0
+- Sub-modules instantiated:
+  - `exp_lut.sv` ✅ — per-element exp
+  - `fp32_add_tree.sv` ❌ new — reduction sum over T elements (parameterised depth)
+  - `fp32_div.sv` ❌ new — scalar FP32 divide for normalisation (1/sum × each exp output)
+- Verify: T=4 row, causal mask, compare to C# `AttentionCore` softmax reference
+
+#### 3c. Attention core (`attention_core.sv`) — integration
+- Wires: `bf16w_matmul` (QKV + output proj) + `fp32_matmul` (scores + weighted sum) + `softmax`
+- Verify: forward pass output matches `AttentionCore.Forward()` C# reference for small config (heads=1, d=4, T=4)
+
+#### New primitives required before 3b:
+
+| Module | Purpose | Status |
+|---|---|---|
+| `fp32_matmul.sv` | FP32×FP32 matmul (scores + weighted sum) | ❌ next |
+| `fp32_add_tree.sv` | Reduction sum over T FP32 values | ❌ |
+| `fp32_div.sv` | Scalar FP32 division | ❌ |
+| `softmax.sv` | Per-row softmax (exp + sum + divide) | ❌ |
+| `attention_core.sv` | Full attention forward (integrator) | ❌ |
 
 ### 4. MLP (feed-forward block)
 - Two linear layers + GeLU activation
