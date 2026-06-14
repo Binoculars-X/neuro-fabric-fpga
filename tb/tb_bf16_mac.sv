@@ -61,6 +61,7 @@ module tb_bf16_mac;
     logic [31:0] in_c   [0:N_VECTORS-1];
     logic [31:0] exp_fp32 [0:N_VECTORS-1];
     logic [15:0] exp_bf16 [0:N_VECTORS-1];
+    logic [31:0] got_fp32 [0:N_VECTORS-1];
 
     // ------------------------------------------------------------------
     // File handles and paths
@@ -69,8 +70,9 @@ module tb_bf16_mac;
     string input_path;
     string expected_path;
     string passfail_path;
+    string output_path;
 
-    integer fd_in, fd_exp, fd_pf;
+    integer fd_in, fd_exp, fd_pf, fd_out;
     integer scan_ok;
     int     fail_count;
     string  fail_detail;
@@ -86,6 +88,7 @@ module tb_bf16_mac;
         input_path    = {testvecs_dir, "/bf16_mac/input.hex"};
         expected_path = {testvecs_dir, "/bf16_mac/expected.hex"};
         passfail_path = {testvecs_dir, "/bf16_mac/pass_fail.txt"};
+        output_path   = {testvecs_dir, "/bf16_mac/output.hex"};
 
         // Read input vectors
         fd_in = $fopen(input_path, "r");
@@ -145,6 +148,7 @@ module tb_bf16_mac;
 
                 // Capture output BEFORE driving new input (combinational output settled)
                 if (valid_out && out_idx < N_VECTORS) begin
+                    got_fp32[out_idx] = result_fp32;
                     if (result_fp32 !== exp_fp32[out_idx]) begin
                         fail_count++;
                         if (fail_count == 1)
@@ -187,6 +191,14 @@ module tb_bf16_mac;
         end else begin
             $display("FAIL — %0d mismatches; first: %s", fail_count, fail_detail);
             write_passfail({"FAIL:", fail_detail});
+        end
+
+        // Write output.hex for VsSoftware comparison
+        fd_out = $fopen(output_path, "w");
+        if (fd_out != 0) begin
+            for (int i = 0; i < N_VECTORS; i++)
+                $fwrite(fd_out, "%08h\n", got_fp32[i]);
+            $fclose(fd_out);
         end
 
         $finish;

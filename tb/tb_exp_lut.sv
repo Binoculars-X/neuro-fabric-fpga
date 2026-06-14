@@ -51,8 +51,9 @@ module tb_exp_lut;
     // ------------------------------------------------------------------
     // Vector storage
     // ------------------------------------------------------------------
-    logic [31:0] in_x   [0:N_VECTORS-1];
-    logic [31:0] exp_out [0:N_VECTORS-1];
+    logic [31:0] in_x    [0:N_VECTORS-1];
+    logic [31:0] exp_out  [0:N_VECTORS-1];
+    logic [31:0] got_out  [0:N_VECTORS-1];
 
     // ------------------------------------------------------------------
     // Checker temporaries
@@ -64,8 +65,8 @@ module tb_exp_lut;
     // File / loop state
     // ------------------------------------------------------------------
     string  testvecs_dir;
-    string  input_path, expected_path, passfail_path;
-    integer fd_in, fd_exp, fd_pf, scan_ok;
+    string  input_path, expected_path, passfail_path, output_path;
+    integer fd_in, fd_exp, fd_pf, fd_out, scan_ok;
     int     fail_count;
     string  fail_detail;
     int     in_idx, out_idx, total_cycles, cyc;
@@ -78,6 +79,7 @@ module tb_exp_lut;
             testvecs_dir = "../../run/fpga-testvecs";
 
         input_path    = {testvecs_dir, "/exp_lut/input.hex"};
+        output_path   = {testvecs_dir, "/exp_lut/output.hex"};
         expected_path = {testvecs_dir, "/exp_lut/expected.hex"};
         passfail_path = {testvecs_dir, "/exp_lut/pass_fail.txt"};
 
@@ -128,6 +130,7 @@ module tb_exp_lut;
             // exp(x) >= 0 so bits are positive IEEE 754: ULP diff = |got - exp| as unsigned ints.
             // Allows for XSim shortreal→real promotion causing last-bit rounding differences.
             if (valid_out && out_idx < N_VECTORS) begin
+                got_out[out_idx] = result_fp32;
                 ulp_diff  = int'(result_fp32) - int'(exp_out[out_idx]);
                 if (ulp_diff < 0) ulp_diff = -ulp_diff;
                 pass_flag = (ulp_diff <= 16) ? 1 : 0;
@@ -162,6 +165,14 @@ module tb_exp_lut;
         end else begin
             $display("FAIL — %0d mismatches; first: %s", fail_count, fail_detail);
             write_passfail({"FAIL:", fail_detail});
+        end
+
+        // Write output.hex for VsSoftware comparison
+        fd_out = $fopen(output_path, "w");
+        if (fd_out != 0) begin
+            for (int i = 0; i < N_VECTORS; i++)
+                $fwrite(fd_out, "%08h\n", got_out[i]);
+            $fclose(fd_out);
         end
 
         $finish;

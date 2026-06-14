@@ -67,8 +67,8 @@ module tb_bf16w_matmul;
     logic [31:0] got_c  [0:M*N-1];
 
     string  testvecs_dir;
-    string  input_path, expected_path, passfail_path;
-    integer fd_in, fd_exp, fd_pf, scan_ok;
+    string  input_path, expected_path, passfail_path, output_path;
+    integer fd_in, fd_exp, fd_pf, fd_out, scan_ok;
     int     fail_count;
     string  fail_detail;
     int     rows_received, ulp_diff, cyc;
@@ -78,6 +78,7 @@ module tb_bf16w_matmul;
             testvecs_dir = "../../run/fpga-testvecs";
 
         input_path    = {testvecs_dir, "/bf16w_matmul/input.hex"};
+        output_path   = {testvecs_dir, "/bf16w_matmul/output.hex"};
         expected_path = {testvecs_dir, "/bf16w_matmul/expected.hex"};
         passfail_path = {testvecs_dir, "/bf16w_matmul/pass_fail.txt"};
 
@@ -168,6 +169,14 @@ module tb_bf16w_matmul;
         end else begin
             $display("FAIL — %0d mismatches; first: %s", fail_count, fail_detail);
             write_pf({"FAIL:", fail_detail});
+        end
+
+        // Write output.hex for VsSoftware comparison
+        fd_out = $fopen(output_path, "w");
+        if (fd_out != 0) begin
+            for (int ii = 0; ii < M*N; ii++)
+                $fwrite(fd_out, "%08h\n", got_c[ii]);
+            $fclose(fd_out);
         end
 
         $finish;
