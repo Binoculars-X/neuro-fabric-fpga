@@ -181,9 +181,12 @@ flowchart TD
 | exp LUT entries | 16-bit | BF16 | 256-entry BRAM ROM, `2^(i/255)` |
 | fp32_sqrt seed ROM | 32-bit | FP32 | 256-entry, indexed by mantissa top 8 bits |
 
-## No ARM/PS Core
+## ARM / PS Role
 
-All compute is in the **PL (programmable logic)**. The host C# process communicates
-over JTAG (XSim simulation: file I/O hex vectors). No Zynq PS core, no AXI bus, no
-embedded Linux. This is pure RTL: token indices and weights arrive via a synchronous
-write-port FSM; logits and updated weights leave via a read-port FSM.
+The **training datapath runs entirely in PL (programmable logic)**. The Zynq PS (ARM)
+is used only for orchestration: loading test vectors, triggering training steps,
+reading results, and experiment control. It does not participate in any arithmetic —
+no matrix multiply, no Adam update, no activation computation runs on ARM.
+
+In XSim simulation the host role is played by C# directly via file I/O (hex vectors);
+on hardware the PS takes that role over AXI or JTAG.
