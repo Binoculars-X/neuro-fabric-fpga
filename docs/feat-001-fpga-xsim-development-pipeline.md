@@ -1,14 +1,20 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c complete and passing XSim; ready for step 4 (MLP)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a complete and passing XSim; implementing step 4b (mlp_core)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
 
-## Description
+## Goal
 
-Standard bottom-up pipeline for bringing NeuronFabric training onto Xilinx FPGA with XSim simulation at each layer before moving to hardware.
+Bring NeuronFabric transformer training onto Xilinx FPGA in two phases:
+
+**Phase 1 — Correctness proof (XSim simulation)**
+Sequential RTL using shared compute units. Proves every arithmetic operation matches the C# reference within tolerance. No resource optimisation. All steps verified in Vivado XSim before any hardware is touched.
+
+**Phase 2 — Parallel FPGA architecture (pre-hardware synthesis)**
+Rewrite integrators (`attention_core`, `mlp_core`) so each weight matrix has its own co-located BRAM + DSP48 MAC array — all firing in the same clock cycle. This is the NeuronFabric paper architecture: local weights grouped around computing cores, replicated until BRAM/DSP48 budget is exhausted. Phase 2 begins after all Phase 1 XSim steps pass.
 
 ## Development order
 
@@ -74,6 +80,12 @@ Step 3 is broken into independent sub-modules, each verified standalone before w
 #### 3c. Attention core (`attention_core.sv`) — integration
 - Wires: `bf16w_matmul` (QKV + output proj) + `fp32_matmul` (scores + weighted sum) + `softmax`
 - Verify: forward pass output matches `AttentionCore.Forward()` C# reference for small config (heads=1, d=4, T=4)
+- **⚠️ Current implementation is sequential** (one `bf16w_matmul` instance reused for Q, K, V, Wo). This minimises resources for XSim verification but is not the target architecture.
+- **Target parallel architecture** (required before hardware synthesis):
+  - 3× `bf16w_matmul` instances for Q, K, V firing simultaneously
+  - 2× `fp32_matmul` instances for scores and AV (can overlap after Q/K/V done)
+  - Parallelising Q/K/V alone gives 3× throughput on the projection phase
+  - This is the natural FPGA mapping: each matmul unit occupies a DSP48+BRAM region, all fire in the same clock cycle
 
 #### New primitives required before 3b:
 
@@ -86,9 +98,43 @@ Step 3 is broken into independent sub-modules, each verified standalone before w
 | `attention_core.sv` | Full attention forward (integrator) | ✅ done |
 
 ### 4. MLP (feed-forward block)
-- Two linear layers + GeLU activation
-- Verify: forward output matches `AttentionLayer` FF block
-- GeLU approximation may need its own LUT (or polynomial); decide at this stage
+
+The feedforward block from `AttentionLayer.Forward`:
+```
+H1 = X · Wff1        [T×d] × [d×ffDim]  → [T×ffDim]   (bf16w matmul)
+G  = GeLU(H1)        [T×ffDim]           → [T×ffDim]   (element-wise)
+Y  = G · Wff2        [T×ffDim] × [ffDim×d] → [T×d]     (bf16w matmul)
+```
+
+GeLU formula (tanh approximation, matching C# `AttentionLayer.Gelu`):
+```
+GeLU(x) = 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715·x³)))
+        = 0.5 · x · (1 + tanh(0.7978845608 · (x + 0.044715·x³)))
+```
+
+#### New primitives required
+
+| Module | Purpose |
+|---|---|
+| `gelu.sv` | Element-wise GeLU: polynomial + tanh approximation, pipelined | ✅ done |
+| `mlp_core.sv` | Integrator: bf16w_matmul → gelu → bf16w_matmul | ⏳ next |
+
+#### Sub-steps
+
+**4a. `gelu.sv`**
+- Input/output: FP32 scalar (or row of T FP32 values)
+- Tanh approximation: `0.5·x·(1+tanh(c·(x+0.044715·x³)))` where `c=0.7978845608`
+- Implementation options (decide at this stage):
+  - **LUT-256 for tanh**: `tanh(x) = 2·σ(2x)−1`; map through a LUT over the relevant range — consistent with the exp LUT approach already used in softmax
+  - **Polynomial**: degree-5 minimax over [−3, 3], clamp outside — simpler RTL but less principled
+- Verify: T=4 random FP32 inputs, compare to C# `AttentionLayer.Gelu(x)` with `ReferenceExactHardwareMode`; expected tolerance ≤2 ULP (single multiply+tanh stage, same x87 artifact as softmax)
+
+**4b. `mlp_core.sv`**
+- Interface mirrors `attention_core.sv`: `x_wr_*` (FP32 activations), `wff1_wr_*` / `wff2_wr_*` (BF16 weights), `start`, `out_row`, `out_valid`, `out_row_idx`
+- Reuses one `bf16w_matmul` instance sequentially for both Wff1 and Wff2 passes (same area-saving strategy as `attention_core`)
+- FSM: LD_W1 → RUN_W1 → WAIT_W1 → GELU → LD_W2 → RUN_W2 → WAIT_W2 → OUTPUT → IDLE
+- Parameters: T, D (=embedDim), FF (=ffDim), MAC_LAT, MUL_LAT
+- Verify: forward output matches `AttentionLayer` FF sub-block (`xNorm2 → Wff1 → GeLU → Wff2`) for T=4, D=4, FF=16 — all T×D elements within `XSimCollection.UlpRelTol`
 
 ### 5. LayerNorm
 - Mean and variance reduction over embed dim
