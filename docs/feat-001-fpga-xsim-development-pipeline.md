@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b complete and passing XSim; next: step 6 (Adam optimiser)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b, 6a complete and passing XSim; next: step 6b (adam_core)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -183,9 +183,80 @@ C# reference for `fp32_sqrt.sv`: add `ExpLutHelper.RecipSqrt(float x)` — same 
 - Verify: T=4 token rows, D=4, random FP32 inputs and random γ/β weights; C# `LayerNorm.Forward()` reference; all T×D elements within `VsSoftwareRelTol`
 
 ### 6. Adam optimiser
-- Moment accumulators (m=FP32, v=FP32) updated each step
-- BF16 weight store with FP32 master (w=BF16, master=FP32)
-- Verify: weight update trajectory matches C# `AdamBF16WeightsAttentionCore` for 100 steps
+
+Implements the BF16-weights Adam update step, matching `AdamBF16WeightsAttentionCore.ApplyUpdate()` exactly. Every C# arithmetic operation is mapped to a synthesizable RTL equivalent — no simulation-only primitives, no deferred work for Phase 2.
+
+Per-parameter layout (matches the C# `_state` dictionary):
+```
+w     — BF16  (2 bytes) — current weight, quantised each step
+m     — FP32  (4 bytes) — first moment (β₁ EMA of gradient)
+v     — FP32  (4 bytes) — second moment (β₂ EMA of gradient²)
+```
+
+Update rule (one scalar, one clock cycle in RTL):
+```
+m    ← β₁·m + (1−β₁)·g
+v    ← β₂·v + (1−β₂)·g²
+mHat = m / bc1                    -- fp32_div.sv
+vHat = v / bc2                    -- fp32_div.sv
+sqrtV = vHat * fp32_sqrt(vHat)    -- fp32_sqrt gives 1/√vHat; multiply back to get √vHat
+denom = sqrtV + ε                 -- shortreal add
+wf   = Decode(w_bf16)             -- bit-shift (bf16_mac decode path)
+wf  -= lr * mHat / denom          -- fp32_div.sv
+w_bf16 ← Encode(wf)              -- truncate mantissa bits [15:0]
+```
+
+Constants: β₁=0.9, β₂=0.999, ε=1e-8. `t` = global step counter (bias correction).
+
+#### Complete C# → RTL operation mapping (no surprises for Phase 2)
+
+| C# expression | RTL implementation | Module | Phase 2 ready? |
+|---|---|---|---|
+| `Beta1 * m + (1-Beta1) * g` | `shortreal` multiply+add | none | ✅ |
+| `Beta2 * v + (1-Beta2) * g*g` | `shortreal` multiply+add | none | ✅ |
+| `mf / bc1` | FP32 divide | `fp32_div.sv` ✅ exists | ✅ |
+| `vf / bc2` | FP32 divide | `fp32_div.sv` ✅ exists | ✅ |
+| `MathF.Sqrt(vHat)` | `vHat * fp32_sqrt(vHat)` — multiply vHat by its own reciprocal sqrt | `fp32_sqrt.sv` ✅ exists + `shortreal` mul | ✅ |
+| `sqrt(vHat) + Epsilon` | `shortreal` add | none | ✅ |
+| `lr * mHat / (sqrt(vHat) + eps)` | FP32 divide | `fp32_div.sv` ✅ exists | ✅ |
+| `MathF.Pow(Beta1, step)` | passed as FP32 input `bc1_fp32` (caller computes) | none — avoids `$pow()` | ✅ |
+| `MathF.Pow(Beta2, step)` | passed as FP32 input `bc2_fp32` (caller computes) | none — avoids `$pow()` | ✅ |
+| `Bf16.Decode(w)` | bit-shift: `{w[15], w[14:7], w[6:0], 16'b0}` | `bf16_mac.sv` decode path ✅ | ✅ |
+| `Bf16.Encode(w)` | truncate: `wf_bits[31:16]` | `bf16_mac.sv` encode path ✅ | ✅ |
+
+**No new arithmetic modules required.** `adam_cell.sv` wires existing primitives only.
+
+#### Sub-steps
+
+**6a. `adam_cell.sv`** — scalar Adam update for one parameter
+- Inputs: `g_fp32`, `w_bf16`, `m_fp32`, `v_fp32`, `lr_fp32`, `bc1_fp32`, `bc2_fp32`, `en`
+- Outputs: `w_bf16_out`, `m_fp32_out`, `v_fp32_out` (registered, available next cycle)
+- All arithmetic in `shortreal` inside one `always_ff` block; instantiates `fp32_div` (×3) and `fp32_sqrt` (×1)
+- `bc1`, `bc2` are per-step FP32 inputs — caller (`adam_core`) computes `1 − β₁ᵗ`, `1 − β₂ᵗ` and passes them in
+- Parameters: β₁, β₂, ε hardcoded as localparams matching C# values
+- Verify: 10 sequential Adam steps on one parameter; compare w_bf16, m, v after each step to C# `AdamBF16WeightsAttentionCore` reference within `VsSoftwareRelTol`
+
+**6b. `adam_core.sv`** — applies `adam_cell` to an entire weight matrix
+- Inputs: `grad [R*C*32-1:0]`, `w_bf16 [R*C*16-1:0]`, `m [R*C*32-1:0]`, `v [R*C*32-1:0]`, `lr_fp32`, `bc1_fp32`, `bc2_fp32`, `start`
+- Outputs: `w_bf16_out`, `m_out`, `v_out` (all R×C values, valid when `done=1`)
+- FSM: IDLE → UPDATE (R×C cycles, one `adam_cell` instance, one parameter per cycle) → DONE
+- Parameters: `R`, `C`
+- Verify: Wq matrix (4×4), 100 Adam steps; compare final w_bf16/m/v to C# reference within `VsSoftwareRelTol`
+
+#### C# test vector generation
+
+`FpgaAdamVecGen.cs` — generates per step:
+- `input.hex`: g, w_bf16, m, v per parameter; plus scalar `bc1`, `bc2`, `lr`
+- `expected.hex`: w_bf16_out, m_out, v_out after the step
+
+C# reference: `AdamBF16WeightsAttentionCore.ApplyUpdate()` called directly for each step.
+
+#### New primitives required
+
+| Module | Purpose | Status |
+|---|---|---|
+| `adam_cell.sv` | Scalar Adam: wires fp32_div × 3, fp32_sqrt × 1, BF16 encode/decode | ✅ done |
+| `adam_core.sv` | Matrix Adam: iterates `adam_cell` over R×C params per step | ⏳ |
 
 ### 7. Full Transformer (integration)
 - Stack N layers; wire residual connections; add embedding + unembedding
