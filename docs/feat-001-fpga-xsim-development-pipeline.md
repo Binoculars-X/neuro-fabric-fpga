@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b complete and passing XSim; ready for step 3c (Attention core integration)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c complete and passing XSim; ready for step 4 (MLP)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -83,7 +83,7 @@ Step 3 is broken into independent sub-modules, each verified standalone before w
 | `fp32_add_tree.sv` | Reduction sum over T FP32 values | ✅ done |
 | `fp32_div.sv` | Scalar FP32 division | ✅ done |
 | `softmax.sv` | Per-row softmax (exp + sum + divide) | ✅ done |
-| `attention_core.sv` | Full attention forward (integrator) | ❌ next |
+| `attention_core.sv` | Full attention forward (integrator) | ✅ done |
 
 ### 4. MLP (feed-forward block)
 - Two linear layers + GeLU activation
