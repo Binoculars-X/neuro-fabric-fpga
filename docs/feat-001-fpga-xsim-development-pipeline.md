@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b complete and passing XSim; ready for step 3 (Attention)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b complete and passing XSim; ready for step 3c (Attention core integration)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -67,8 +67,8 @@ Step 3 is broken into independent sub-modules, each verified standalone before w
 - Causal mask applied before exp: scores at masked positions set to −∞ → exp → 0
 - Sub-modules instantiated:
   - `exp_lut.sv` ✅ — per-element exp
-  - `fp32_add_tree.sv` ❌ new — reduction sum over T elements (parameterised depth)
-  - `fp32_div.sv` ❌ new — scalar FP32 divide for normalisation (1/sum × each exp output)
+  - `fp32_add_tree.sv` ✅ — reduction sum over T elements (parameterised depth)
+  - `fp32_div.sv` ✅ — scalar FP32 divide for normalisation (1/sum × each exp output)
 - Verify: T=4 row, causal mask, compare to C# `AttentionCore` softmax reference
 
 #### 3c. Attention core (`attention_core.sv`) — integration
@@ -79,11 +79,11 @@ Step 3 is broken into independent sub-modules, each verified standalone before w
 
 | Module | Purpose | Status |
 |---|---|---|
-| `fp32_matmul.sv` | FP32×FP32 matmul (scores + weighted sum) | ❌ next |
-| `fp32_add_tree.sv` | Reduction sum over T FP32 values | ❌ |
-| `fp32_div.sv` | Scalar FP32 division | ❌ |
-| `softmax.sv` | Per-row softmax (exp + sum + divide) | ❌ |
-| `attention_core.sv` | Full attention forward (integrator) | ❌ |
+| `fp32_matmul.sv` | FP32×FP32 matmul (scores + weighted sum) | ✅ done |
+| `fp32_add_tree.sv` | Reduction sum over T FP32 values | ✅ done |
+| `fp32_div.sv` | Scalar FP32 division | ✅ done |
+| `softmax.sv` | Per-row softmax (exp + sum + divide) | ✅ done |
+| `attention_core.sv` | Full attention forward (integrator) | ❌ next |
 
 ### 4. MLP (feed-forward block)
 - Two linear layers + GeLU activation
