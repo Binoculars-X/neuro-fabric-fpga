@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a complete and passing XSim; implementing step 4b (mlp_core)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b complete and passing XSim; implementing step 5 (layernorm)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -117,7 +117,7 @@ GeLU(x) = 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715·x³)))
 | Module | Purpose |
 |---|---|
 | `gelu.sv` | Element-wise GeLU: polynomial + tanh approximation, pipelined | ✅ done |
-| `mlp_core.sv` | Integrator: bf16w_matmul → gelu → bf16w_matmul | ⏳ next |
+| `mlp_core.sv` | Integrator: bf16w_matmul → gelu → bf16w_matmul | ✅ |
 
 #### Sub-steps
 
@@ -137,9 +137,50 @@ GeLU(x) = 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715·x³)))
 - Verify: forward output matches `AttentionLayer` FF sub-block (`xNorm2 → Wff1 → GeLU → Wff2`) for T=4, D=4, FF=16 — all T×D elements within `XSimCollection.UlpRelTol`
 
 ### 5. LayerNorm
-- Mean and variance reduction over embed dim
-- Reciprocal sqrt via Newton-Raphson or LUT
-- Verify: normalised output matches C# `LayerNorm` within tolerance
+
+Forward (per token row, C# `LayerNorm.Forward`):
+```
+μ      = (1/D) · Σ x[d]
+σ²     = (1/D) · Σ (x[d] − μ)²
+invStd = 1 / √(σ² + ε)          ε = 1e-5
+y[d]   = γ[d] · (x[d] − μ) · invStd + β[d]
+```
+
+One `layernorm.sv` processes one token row (D FP32 values) at a time; the caller feeds T rows sequentially.
+
+No new arithmetic primitives are needed for mean/variance accumulation or scale — those are `shortreal` add/multiply, same as all other modules. However, `invStd = 1/√(σ²+ε)` requires a **synthesizable sqrt** — `$sqrt()` is simulation-only and does NOT synthesize. We implement `fp32_sqrt.sv` using iterative Newton–Raphson (same approach as `fp32_div.sv`), both for synthesis correctness and so the Phase 1 test exercises the real algorithm.
+
+C# reference for `fp32_sqrt.sv`: add `ExpLutHelper.RecipSqrt(float x)` — same seed table + same two iterations using `(float)((double)a op (double)b)` per multiply (`ReferenceExactHardwareMode`). `LayerNorm.Forward` uses `1f / MathF.Sqrt(var_ + _eps)` — the C# vecgen will call `ExpLutHelper.RecipSqrt(var_ + eps)` instead. Also add a pure-C# unit test that `RecipSqrt(x)` converges to within `VsSoftwareRelTol` of `1f / MathF.Sqrt(x)` over a range of positive inputs.
+
+#### New primitives required
+
+| Module | Purpose | Status |
+|---|---|---|
+| `fp32_sqrt.sv` | `1/√x` via Newton–Raphson, combinatorial, matches synthesized FP | ⏳ next |
+| `layernorm.sv` | Mean + variance reduction, scale/shift; instantiates `fp32_sqrt` | ⏳ |
+
+#### Sub-steps
+
+**5a. `fp32_sqrt.sv`**
+- Computes `1/√x` (reciprocal square root) for FP32 scalar input
+- Implementation: seed from top 8 bits of mantissa (256-entry ROM), then 2× Newton–Raphson: `r ← r · (1.5 − 0.5 · x · r²)` using `shortreal` multiply — each iteration is one `shortreal` assignment (one rounding)
+- Fully synthesizable: only `shortreal` multiply + ROM — no `$sqrt()`
+- C# reference: add `ExpLutHelper.RecipSqrt(float x)` — same seed table + same two iterations using `(float)((double)a op (double)b)` per multiply (`ReferenceExactHardwareMode`)
+- Pure-C# unit test (`Neuro.Attention.Tests`): `RecipSqrt(x)` converges to within `VsSoftwareRelTol` of `1f / MathF.Sqrt(x)` over a range of positive inputs
+- XSim verify: 32 random positive FP32 inputs; compare RTL output to `ExpLutHelper.RecipSqrt()` within `VsSoftwareRelTol`
+
+**5b. `layernorm.sv`**
+- Interface: `x_in [D×32]` (FP32 row), `gamma [D×32]`, `beta [D×32]`, `start`, `y_out [D×32]`, `out_valid`
+- Parameters: `D` (embed dim), `MUL_LAT`, `ADD_LAT`
+- FSM:
+  - `SUM_X` — accumulate Σx[d] over D cycles using running FP32 adder
+  - `MEAN` — divide by D (multiply by `1/D`, precomputed constant)
+  - `SUM_VAR` — second pass: accumulate Σ(x[d]−μ)² — requires buffering x (D-deep shift register)
+  - `VAR` — divide by D → σ²; then feed `σ²+ε` to `fp32_sqrt` instance (combinatorial → result available same cycle)
+  - `SCALE` — third pass: `y[d] = γ[d] · (x[d] − μ) · invStd + β[d]` — one multiply chain per cycle
+  - `OUTPUT` — assert `out_valid`, stream T rows from caller
+- Buffering: x[] stored in a D-entry FP32 shift register (or BRAM for large D); γ[] and β[] loaded once, held in registers
+- Verify: T=4 token rows, D=4, random FP32 inputs and random γ/β weights; C# `LayerNorm.Forward()` reference; all T×D elements within `VsSoftwareRelTol`
 
 ### 6. Adam optimiser
 - Moment accumulators (m=FP32, v=FP32) updated each step
