@@ -1,7 +1,7 @@
 # FEAT-001 — FPGA XSim Development Pipeline (Xilinx)
 
 ## Status
-In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b, 6a, 6b complete and passing XSim (26/26 tests); next: step 7 (full transformer integration)
+In progress — steps 1, 1b, 2, 2b, 3a, 3b, 3c, 4a, 4b, 5a, 5b, 6a, 6b, 7a complete; 61 tests; next: step 7b (train step)
 
 ## Discovered
 11/06/26 — Day 18. Natural next step after LUT exp approximation is validated on CPU.
@@ -259,14 +259,136 @@ C# reference: `AdamBF16WeightsAttentionCore.ApplyUpdate()` called directly for e
 | `adam_core.sv` | Matrix Adam: iterates `adam_cell` over R×C params per step | ✅ done |
 
 ### 7. Full Transformer (integration)
-- Stack N layers; wire residual connections; add embedding + unembedding
-- **Do NOT attempt Shakespeare 334K in XSim** — cycle-accurate simulation of 334K params × 1,000 steps would take days
-- Verify strategy: generate golden test vectors from C# using a **tiny synthetic model** (e.g. layers=2, embed=8, heads=2, ff=24, vocab=16, seqLen=4) — small enough that XSim finishes in seconds
-  - Forward pass: compare RTL logits to C# `CpuAdamBF16WeightsTransformerBus.Forward()` output
-  - Backward pass: compare RTL weight deltas to C# after 1 Adam step
-  - Loss: compare scalar cross-entropy to C# `TrainStep()` return value
-- Once RTL passes on the synthetic model, full Shakespeare training runs on **actual FPGA hardware** (not XSim)
-- Test vector generation: add a `Neuro.Attention.Tests` fixture that serialises tiny-model I/O to binary files for consumption by the XSim testbench
+
+The full transformer is too large to simulate in XSim at production scale (334K params × training steps would take days). Step 7 uses a **tiny synthetic model** small enough for XSim to finish in seconds, but large enough to exercise every sub-module in the correct wiring order.
+
+#### Tiny model configuration (Phase 1 implementation — constrained by existing RTL)
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `seqLen` (T) | 4 | hardcoded in attention_core/mlp_core |
+| `embedDim` (D) | 4 | hardcoded in existing sub-modules |
+| `numHeads` | 1 | headDim = D/numHeads = 4 — matches DH=4 in attention_core |
+| `ffDim` (FF) | 4 | hardcoded in mlp_core |
+| `numLayers` (L) | 2 | exercises layer stacking + residual |
+| `vocabSize` (V) | 16 | minimal embedding table |
+
+Note: D=4/heads=1 differs from the originally planned D=8/heads=2. Existing RTL sub-modules
+are hardcoded to T=D=DH=FF=4. Phase 2 will generalise with parameterised register files.
+
+Total trainable parameters: 2×(4×4×4 + 2×4×4) + 16×4 ≈ **192 parameters**.
+
+#### Full forward pipeline (C# reference: `TransformerBus.Forward`)
+
+```
+tokens[T] → Embedding[V×D] → x[T×D] + PE
+for l = 0..L-1:
+    xNorm1  = LayerNorm1(x)           -- layernorm.sv
+    attn    = AttentionCore.Forward(xNorm1)  -- attention_core.sv
+    x       = x + attn                -- residual add
+    xNorm2  = LayerNorm2(x)           -- layernorm.sv
+    mlp     = MlpCore.Forward(xNorm2) -- mlp_core.sv
+    x       = x + mlp                 -- residual add
+logits  = x · Embeddingᵀ             -- fp32_matmul.sv (weight-tied, NO final LN)
+```
+
+**Note:** `TransformerBus.Forward` does NOT apply a final LayerNorm before the output
+projection. transformer.sv matches this exactly.
+
+#### Full train step (C# reference: `TransformerBus.TrainStep` + `AdamBF16WeightsAttentionCore.ApplyUpdate`)
+
+```
+loss, dLogits = CrossEntropy(logits, targets)
+ClipGradNorm(dLogits, 1.0)
+dX = dLogits · Embedding  (through tied output projection)
+for l = L-1..0:
+    dX = AttentionLayer.Backward(dX)  -- backprop through attention + MLP + LN
+ApplyAdam(all weights)                -- adam_core.sv per weight matrix
+```
+
+#### RTL modules required for step 7 (all ✅ done)
+
+| Module | Role in transformer |
+|---|---|
+| `layernorm.sv` | LN1, LN2 per layer (no final LN) |
+| `attention_core.sv` | Multi-head attention (numHeads instances per layer) |
+| `mlp_core.sv` | Feed-forward block per layer |
+| `adam_core.sv` | Weight update for every weight matrix |
+| `fp32_matmul.sv` | Tied output projection (x · Embeddingᵀ) |
+| `bf16w_matmul.sv` | Inside attention_core (QKV + Wo) and mlp_core (Wff1, Wff2) |
+| `softmax.sv` | Inside attention_core |
+| `exp_lut.sv` | Inside softmax + cross-entropy loss |
+| `fp32_div.sv` | Inside softmax + adam_cell |
+| `fp32_sqrt.sv` | Inside adam_cell (via layernorm) |
+| `gelu.sv` | Inside mlp_core |
+
+**No new RTL modules required.** Step 7 is pure wiring and testbench infrastructure.
+
+#### New RTL required: `transformer.sv`
+
+- Parameters: `T`, `D`, `NUM_HEADS`, `FF`, `L`, `V`
+- Sub-modules instantiated: L × (`layernorm` × 2 + `attention_core` × NUM_HEADS + `mlp_core`) + `layernorm` (final) + `fp32_matmul` (output projection)
+- Embedding: FP32 lookup table (`embedding[token] → row of D FP32 values`), loaded via write port
+- Weight loading interface: write ports for every weight matrix in every layer (same pattern as `attention_core.sv`)
+- `adam_core.sv` instantiated once per weight matrix (or shared FSM — decide at implementation)
+- FSM: LOAD_WEIGHTS → IDLE → FORWARD → BACKWARD → ADAM_UPDATE → DONE
+
+#### Verification strategy
+
+**7a. Forward pass only** (simpler — no Adam, no backward):
+- Generate golden vectors from C# hardware-mode oracle (`FpgaTransformerVecGen.Build()`) for 2 random seeds
+- Oracle replicates the RTL adder-tree matmul structure exactly: `(p0+p1)+(p2+p3)` with each op as `(float)((double)x op (double)y)`.
+- Write all weights + precomputed x_init to `input.hex`; XSim runs forward; read `output.hex` (logits [T×V])
+- Compare RTL logits to oracle within `VsSoftwareRelTol` (0.01%)
+- `TransformerVsSoftwareTests` (RTL vs `bus.Forward()`) also passes at `VsSoftwareRelTol` — the sequential vs adder-tree difference is within tolerance at this model scale
+
+**7b. One full train step** (forward + backward + Adam):
+- Run 1 `TrainStep` in C# to capture: logits, loss, and all updated weight matrices after Adam
+- XSim runs the same step; compare updated w_bf16/m/v for every weight matrix to C# reference
+- C# oracle: `CpuAdamBF16WeightsTransformerBus` with `GetState()` on every `AdamBF16WeightsAttentionCore`
+- Tolerance: `VsSoftwareRelTol` for logits/loss; `AdamMomentAbsTol` floor for moments
+
+**7c. 10 train steps** (trajectory stability):
+- Run 10 steps in C#; XSim runs same 10 steps; compare final weights only
+- Confirms error does not accumulate across steps at this model scale
+
+#### C# test vector generation
+
+`FpgaTransformerVecGen.cs` in `Neuro.Attention.XSim.LocalTests/Helpers/`:
+- Initialise `CpuAdamBF16WeightsTransformerBus(T=4, D=4, heads=1, FF=4, L=2, V=16, new Random(seed))`
+- Write all initial weights to `input.hex` (embedding [V×D], per-layer: Wq/Wk/Wv/Wo [D×headDim or headDim×D], Wff1 [D×FF], Wff2 [FF×D], LN1/LN2 gamma/beta [D])
+- Write token sequences and targets
+- Run `TrainStep` once (or N times); capture logits, loss, updated weights via new `internal` getters on `AdamBF16WeightsAttentionLayer`
+- Write `expected.hex`
+
+#### New C# infrastructure needed
+
+`AdamBF16WeightsAttentionLayer` needs `internal` getters (same pattern as `AdamBF16WeightsAttentionCore.GetState`):
+- `GetAllWeights()` — returns Wq, Wk, Wv, Wo, Wff1, Wff2, LN1/LN2 gamma/beta as flat arrays
+- `GetAllAdamState()` — returns (wBf16, m, v) for all weight matrices
+
+#### New modules / files summary
+
+| File | Purpose |
+|---|---|
+| `neuro-fabric-fpga/rtl/transformer.sv` | Top-level RTL integrator |
+| `neuro-fabric-fpga/tb/tb_transformer.sv` | Testbench: write weights + tokens, run XSim, dump logits + weights |
+| `Helpers/FpgaTransformerVecGen.cs` | C# vecgen using `CpuAdamBF16WeightsTransformerBus` |
+| `TransformerTests.cs` | XSim tests: 7a forward, 7b one step, 7c ten steps |
+| `TransformerVsSoftwareTests.cs` | VsSoftware tests: RTL output vs real C# oracle |
+
+#### Sub-steps
+
+**7a** — Forward only ✅ **DONE**: `transformer.sv` wired forward path, no backward, no Adam.
+  - Write bus address map: emb_reg (0x000..0x03F), x_init (0x040..0x04F), layer 0 (0x050..0x0BF), layer 1 (0x0C0..0x12F). Total 304 entries.
+  - `TransformerTests.cs`: 2 seeds × (RTL vs hardware-mode vecgen) = 2 tests.
+  - Oracle: `FpgaTransformerVecGen.Build()` — replicates RTL adder-tree matmul `(p0+p1)+(p2+p3)` with double-promoted ops.
+  - Tolerance: `VsSoftwareRelTol` (0.01%) — same discipline as all other primary XSim tests.
+  - `TransformerVsSoftwareTests.cs`: 2 seeds × (RTL vs `bus.Forward()`) = 2 tests, also passing at `VsSoftwareRelTol`.
+
+**7b** — Single train step: add backward path + `adam_core` instances. One token sequence, one step.
+
+**7c** — 10 steps: same testbench, loop, compare final state only.
 
 ## Cross-repo test flow
 
