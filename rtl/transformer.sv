@@ -168,10 +168,15 @@ module transformer #(
     // -----------------------------------------------------------------------
     // Sub-module instances
     // -----------------------------------------------------------------------
-    layernorm #(.D(D)) u_ln (
+    layernorm #(.D(D), .T(T)) u_ln (
         .clk(clk), .rst(rst), .en(en),
         .x_in(ln_x_in), .gamma(ln_gamma), .beta(ln_beta),
-        .start(ln_start), .y_out(ln_y_out), .out_valid(ln_out_valid)
+        .start(ln_start), .y_out(ln_y_out), .out_valid(ln_out_valid),
+        // Backward ports — not yet wired (7b-iv)
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dGamma_flat(), .dBeta_flat()
     );
 
     attention_core #(

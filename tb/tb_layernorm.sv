@@ -29,7 +29,7 @@ module tb_layernorm;
     logic [D*32-1:0] y_out;
     logic             out_valid;
 
-    layernorm #(.D(D)) dut (
+    layernorm #(.D(D), .T(T)) dut (
         .clk      (clk),
         .rst      (rst),
         .en       (en),
@@ -38,7 +38,12 @@ module tb_layernorm;
         .beta     (beta),
         .start    (start),
         .y_out    (y_out),
-        .out_valid(out_valid)
+        .out_valid(out_valid),
+        // Backward ports — not used in forward-only testbench
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dGamma_flat(), .dBeta_flat()
     );
 
     always #5 clk = ~clk;

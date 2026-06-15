@@ -39,7 +39,8 @@
 `timescale 1ns/1ps
 
 module layernorm #(
-    parameter int D = 4
+    parameter int D = 4,
+    parameter int T = 4
 )(
     input  logic clk,
     input  logic rst,
@@ -51,7 +52,18 @@ module layernorm #(
     input  logic             start,
 
     output logic [D*32-1:0] y_out,
-    output logic             out_valid
+    output logic             out_valid,
+
+    // Backward ports
+    input  logic             dy_wr_en,
+    input  logic [7:0]       dy_wr_addr,
+    input  logic [31:0]      dy_wr_data,
+    input  logic             bwd_start,
+    output logic [D*32-1:0]  dx_row,
+    output logic             dx_valid,
+    output logic [$clog2(T)-1:0] dx_row_idx,
+    output logic [D*32-1:0]  dGamma_flat,
+    output logic [D*32-1:0]  dBeta_flat
 );
 
     // ε = 1e-5 as FP32 bits
@@ -81,15 +93,43 @@ module layernorm #(
         for (int d = 0; d < D; d++)
             y_out[d*32 +: 32] = y_reg[d];
 
+    // ── Backward storage ──────────────────────────────────────────────────────
+    shortreal    mean_latch  [0:T-1];
+    logic [31:0] vpe_latch   [0:T-1];  // var_plus_eps FP32 bits per forward row
+    logic [31:0] x_latch     [0:T-1][0:D-1];
+    logic [31:0] dY_reg      [0:T-1][0:D-1];
+    shortreal    dGamma_reg  [0:D-1];
+    shortreal    dBeta_reg   [0:D-1];
+    logic [31:0] dx_out      [0:D-1];
+    int unsigned fwd_row, bwd_row;
+    shortreal    sumDxh, sumDxhXh;
+
+    // dY_reg write port
+    always_ff @(posedge clk)
+        if (dy_wr_en)
+            dY_reg[dy_wr_addr / D][dy_wr_addr % D] <= dy_wr_data;
+
+    // Backward combinatorial outputs
+    always_comb begin
+        for (int d = 0; d < D; d++) begin
+            dx_row     [d*32 +: 32] = dx_out      [d];
+            dGamma_flat[d*32 +: 32] = $shortrealtobits(dGamma_reg[d]);
+            dBeta_flat [d*32 +: 32] = $shortrealtobits(dBeta_reg [d]);
+        end
+    end
+
     // ── FSM ───────────────────────────────────────────────────────────────────
-    typedef enum logic [2:0] {
+    typedef enum logic [3:0] {
         IDLE,
         SUM_X,
         MEAN,
         SUM_VAR,
         VAR,
         SCALE,
-        OUTPUT
+        OUTPUT,
+        BWD_SUM,
+        BWD_EMIT,
+        BWD_ROW_OUT
     } state_t;
 
     state_t      state;
@@ -100,23 +140,41 @@ module layernorm #(
     // invStd is read combinatorially from sqrt_out_bits in SCALE state;
     // var_plus_eps is registered in VAR and stable for all D SCALE cycles.
 
-    // Wire fp32_sqrt input from registered σ²+ε (set in VAR state)
+    // Wire fp32_sqrt input: forward uses var_plus_eps; backward uses vpe_latch[bwd_row]
     shortreal var_plus_eps;
-    assign sqrt_in_bits = $shortrealtobits(var_plus_eps);
+    assign sqrt_in_bits = (state == BWD_SUM || state == BWD_EMIT || state == BWD_ROW_OUT)
+                          ? vpe_latch[bwd_row] : $shortrealtobits(var_plus_eps);
 
     always_ff @(posedge clk) begin
         if (rst) begin
             state         <= IDLE;
             cnt           <= 0;
             out_valid     <= 1'b0;
+            dx_valid      <= 1'b0;
+            dx_row_idx    <= '0;
             sum_acc       <= 0.0;
             mean_sr       <= 0.0;
             var_plus_eps  <= 0.0;
+            fwd_row       <= 0;
+            bwd_row       <= 0;
+            sumDxh        <= 0.0;
+            sumDxhXh      <= 0.0;
             for (int d = 0; d < D; d++) begin
                 x_buf    [d] <= '0;
                 gamma_buf[d] <= '0;
                 beta_buf [d] <= '0;
                 y_reg    [d] <= '0;
+                dx_out   [d] <= '0;
+                dGamma_reg[d] <= 0.0;
+                dBeta_reg [d] <= 0.0;
+            end
+            for (int t2 = 0; t2 < T; t2++) begin
+                mean_latch[t2] <= 0.0;
+                vpe_latch [t2] <= '0;
+                for (int d = 0; d < D; d++) begin
+                    x_latch[t2][d] <= '0;
+                    dY_reg [t2][d] <= '0;
+                end
             end
         end else if (en) begin
             out_valid <= 1'b0;
@@ -125,11 +183,23 @@ module layernorm #(
 
                 // ── Wait for start ────────────────────────────────────────
                 IDLE: begin
-                    if (start) begin
+                    dx_valid <= 1'b0;
+                    if (bwd_start) begin
+                        bwd_row <= 0;
                         for (int d = 0; d < D; d++) begin
-                            x_buf    [d] <= x_in  [d*32 +: 32];
-                            gamma_buf[d] <= gamma [d*32 +: 32];
-                            beta_buf [d] <= beta  [d*32 +: 32];
+                            dGamma_reg[d] <= 0.0;
+                            dBeta_reg [d] <= 0.0;
+                        end
+                        sumDxh   <= 0.0;
+                        sumDxhXh <= 0.0;
+                        cnt      <= 0;
+                        state    <= BWD_SUM;
+                    end else if (start) begin
+                        for (int d = 0; d < D; d++) begin
+                            x_buf         [d] <= x_in  [d*32 +: 32];
+                            x_latch[fwd_row][d] <= x_in[d*32 +: 32];
+                            gamma_buf     [d] <= gamma [d*32 +: 32];
+                            beta_buf      [d] <= beta  [d*32 +: 32];
                         end
                         sum_acc <= 0.0;
                         cnt     <= 0;
@@ -149,7 +219,8 @@ module layernorm #(
 
                 // ── Compute mean = sum * (1/D) ────────────────────────────
                 MEAN: begin
-                    mean_sr <= sum_acc * INV_D;
+                    mean_sr            <= sum_acc * INV_D;
+                    mean_latch[fwd_row] <= sum_acc * INV_D;
                     sum_acc <= 0.0;
                     cnt     <= 0;
                     state   <= SUM_VAR;
@@ -173,10 +244,12 @@ module layernorm #(
                 // fp32_sqrt is combinatorial; result available same cycle.
                 VAR: begin
                     begin
-                        shortreal var_sr, eps_sr;
-                        var_sr       = sum_acc * INV_D;
-                        eps_sr       = $bitstoshortreal(EPS_BITS);
-                        var_plus_eps <= var_sr + eps_sr;
+                        shortreal var_sr, eps_sr, vpe;
+                        var_sr = sum_acc * INV_D;
+                        eps_sr = $bitstoshortreal(EPS_BITS);
+                        vpe    = var_sr + eps_sr;
+                        var_plus_eps       <= vpe;
+                        vpe_latch[fwd_row] <= $shortrealtobits(vpe);
                         // sqrt_out_bits is already driven combinatorially from var_plus_eps.
                         // We register invstd next cycle after var_plus_eps propagates.
                         // → use a 1-cycle SCALE entry to latch invstd.
@@ -208,8 +281,70 @@ module layernorm #(
                 // ── Assert out_valid for one cycle ────────────────────────
                 OUTPUT: begin
                     out_valid <= 1'b1;
+                    fwd_row   <= fwd_row + 1;
                     state     <= IDLE;
                 end
+
+                // ── Backward: accumulate sumDxh, sumDxhXh, dGamma, dBeta ──────────
+                // sqrt_out_bits driven by vpe_latch[bwd_row] (mux above)
+                BWD_SUM: begin
+                    dx_valid <= 1'b0;
+                    begin
+                        shortreal invstd_bwd, xd, xhat, gd, dyh;
+                        invstd_bwd = $bitstoshortreal(sqrt_out_bits);
+                        xd         = $bitstoshortreal(x_latch[bwd_row][cnt]);
+                        xhat       = (xd - mean_latch[bwd_row]) * invstd_bwd;
+                        gd         = $bitstoshortreal(gamma_buf[cnt]);
+                        dyh        = $bitstoshortreal(dY_reg[bwd_row][cnt]) * gd;
+                        sumDxh     <= sumDxh   + dyh;
+                        sumDxhXh   <= sumDxhXh + dyh * xhat;
+                        dGamma_reg[cnt] <= dGamma_reg[cnt]
+                                          + $bitstoshortreal(dY_reg[bwd_row][cnt]) * xhat;
+                        dBeta_reg[cnt]  <= dBeta_reg[cnt]
+                                          + $bitstoshortreal(dY_reg[bwd_row][cnt]);
+                    end
+                    cnt <= cnt + 1;
+                    if (cnt == D - 1) begin
+                        cnt   <= 0;
+                        state <= BWD_EMIT;
+                    end
+                end
+
+                // ── Backward: compute dX[d] for each d and store in dx_out ──────
+                BWD_EMIT: begin
+                    begin
+                        shortreal invstd_bwd, xd, xhat, gd, dxhd, dx_d;
+                        invstd_bwd = $bitstoshortreal(sqrt_out_bits);
+                        xd         = $bitstoshortreal(x_latch[bwd_row][cnt]);
+                        xhat       = (xd - mean_latch[bwd_row]) * invstd_bwd;
+                        gd         = $bitstoshortreal(gamma_buf[cnt]);
+                        dxhd       = $bitstoshortreal(dY_reg[bwd_row][cnt]) * gd;
+                        dx_d       = (invstd_bwd * INV_D)
+                                     * (D * dxhd - sumDxh - xhat * sumDxhXh);
+                        dx_out[cnt] <= $shortrealtobits(dx_d);
+                    end
+                    cnt <= cnt + 1;
+                    if (cnt == D - 1) begin
+                        cnt   <= 0;
+                        state <= BWD_ROW_OUT;
+                    end
+                end
+
+                // ── Assert dx_valid for one cycle, then next row or IDLE ────────
+                BWD_ROW_OUT: begin
+                    dx_valid   <= 1'b1;
+                    dx_row_idx <= bwd_row[$clog2(T)-1:0];
+                    if (bwd_row == T - 1) begin
+                        state <= IDLE;
+                    end else begin
+                        bwd_row  <= bwd_row + 1;
+                        sumDxh   <= 0.0;
+                        sumDxhXh <= 0.0;
+                        state    <= BWD_SUM;
+                    end
+                end
+
+                default: state <= IDLE;
 
             endcase
         end
