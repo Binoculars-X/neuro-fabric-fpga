@@ -185,7 +185,12 @@ module transformer #(
         .wv_wr_en(att_wv_wr_en), .wv_wr_addr(att_wv_wr_addr), .wv_wr_data(att_wv_wr_data),
         .wo_wr_en(att_wo_wr_en), .wo_wr_addr(att_wo_wr_addr), .wo_wr_data(att_wo_wr_data),
         .start(att_start),
-        .out_row(att_out_row), .out_valid(att_out_valid), .out_row_idx(att_out_row_idx)
+        .out_row(att_out_row), .out_valid(att_out_valid), .out_row_idx(att_out_row_idx),
+        // Backward ports — not yet wired (7b-iv)
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dWq_flat(), .dWk_flat(), .dWv_flat(), .dWo_flat()
     );
 
     mlp_core #(

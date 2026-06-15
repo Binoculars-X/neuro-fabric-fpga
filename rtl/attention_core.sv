@@ -80,7 +80,23 @@ module attention_core #(
     // Output: T rows × D FP32 cols, one row per clock
     output logic [D*32-1:0]      out_row,
     output logic                  out_valid,
-    output logic [$clog2(T)-1:0] out_row_idx
+    output logic [$clog2(T)-1:0] out_row_idx,
+
+    // ── Backward pass ─────────────────────────────────────────────────
+    // Upstream gradient dY [T×D] FP32 row-major
+    input  logic        dy_wr_en,
+    input  logic [7:0]  dy_wr_addr,
+    input  logic [31:0] dy_wr_data,
+    input  logic        bwd_start,
+    // dX output — T rows streamed (same protocol as out_row)
+    output logic [D*32-1:0]      dx_row,
+    output logic                  dx_valid,
+    output logic [$clog2(T)-1:0] dx_row_idx,
+    // Weight gradients — flat FP32, stable after T-th dx_valid
+    output logic [D*DH*32-1:0]  dWq_flat,   // [D×DH]
+    output logic [D*DH*32-1:0]  dWk_flat,   // [D×DH]
+    output logic [D*DH*32-1:0]  dWv_flat,   // [D×DH]
+    output logic [DH*D*32-1:0]  dWo_flat    // [DH×D]
 );
 
     // -----------------------------------------------------------------------
@@ -122,10 +138,41 @@ module attention_core #(
     logic [31:0] attn_reg    [0:T-1][0:T-1];
     logic [31:0] attnOut_reg [0:T-1][0:DH-1];
 
+    // ── Backward registers ──────────────────────────────────────────────────
+    logic [31:0] dY_reg       [0:T-1][0:D-1];
+    logic [31:0] dAttnOut_reg [0:T-1][0:DH-1];  // dY · Woᵀ
+    logic [31:0] dA_reg       [0:T-1][0:T-1];   // dAttnOut · Vᵀ (pre-softmax-bwd)
+    logic [31:0] dScores_reg  [0:T-1][0:T-1];   // softmax bwd output × scale
+    logic [31:0] dV_reg       [0:T-1][0:DH-1];  // Aᵀ · dAttnOut
+    logic [31:0] dQ_reg       [0:T-1][0:DH-1];  // dScores · K
+    logic [31:0] dK_reg       [0:T-1][0:DH-1];  // dScoresᵀ · Q
+    logic [31:0] dWo_reg      [0:DH-1][0:D-1];  // attnOutᵀ · dY
+    logic [31:0] dWq_reg      [0:D-1][0:DH-1];  // Xᵀ · dQ
+    logic [31:0] dWk_reg      [0:D-1][0:DH-1];  // Xᵀ · dK
+    logic [31:0] dWv_reg      [0:D-1][0:DH-1];  // Xᵀ · dV
+    logic [31:0] dX_reg       [0:T-1][0:D-1];   // accumulated dXq + dXk + dXv
+
+    always_ff @(posedge clk)
+        if (dy_wr_en)
+            dY_reg[dy_wr_addr / D][dy_wr_addr % D] <= dy_wr_data;
+
+    // Flat gradient output packs (combinational)
+    always_comb begin
+        for (int i = 0; i < D;  i++) for (int j = 0; j < DH; j++) begin
+            dWq_flat[(i*DH+j)*32 +: 32] = dWq_reg[i][j];
+            dWk_flat[(i*DH+j)*32 +: 32] = dWk_reg[i][j];
+            dWv_flat[(i*DH+j)*32 +: 32] = dWv_reg[i][j];
+        end
+        for (int i = 0; i < DH; i++) for (int j = 0; j < D; j++)
+            dWo_flat[(i*D+j)*32 +: 32] = dWo_reg[i][j];
+    end
+
+    int bwd_phase;  // 0–3 for BWM phases; 0–7 for FPM phases
+
     // -----------------------------------------------------------------------
     // FSM states
     // -----------------------------------------------------------------------
-    typedef enum logic [4:0] {
+    typedef enum logic [5:0] {
         IDLE,
         Q_LD_A,  Q_LD_B,  Q_RUN,  Q_WAIT,
         K_LD_A,  K_LD_B,  K_RUN,  K_WAIT,
@@ -133,7 +180,15 @@ module attention_core #(
         SC_LD_A, SC_LD_B, SC_RUN, SC_WAIT,
         SM_FEED, SM_WAIT,
         AV_LD_A, AV_LD_B, AV_RUN, AV_WAIT,
-        OUT_LD_A,OUT_LD_B,OUT_RUN,OUT_WAIT
+        OUT_LD_A,OUT_LD_B,OUT_RUN,OUT_WAIT,
+        // ── Backward ──────────────────────────────────────────────────
+        // bwd_phase selects which gradient is computed:
+        //   BWD_BWM_*: 0=dAttnOut 1=dXq 2=dXk 3=dXv
+        //   BWD_FPM_*: 0=dA 1=dV 2=dQ 3=dK 4=dWo 5=dWq 6=dWk 7=dWv
+        BWD_BWM_LD,  BWD_BWM_RUN,  BWD_BWM_WAIT,   // bf16w_matmul gradient step
+        BWD_FPM_LD,  BWD_FPM_RUN,  BWD_FPM_WAIT,   // fp32_matmul gradient step
+        BWD_SM_BACK,    // softmax backward + scale (element-wise, 1 cycle)
+        BWD_EMIT        // stream T rows of dX_reg
     } state_t;
 
     state_t state;
@@ -344,24 +399,180 @@ module attention_core #(
             end
             OUT_RUN: bwm_start = 1'b1;
 
+            // ── Backward bf16w_matmul load ─────────────────────────────────
+            // All loads: A[T×DH] and B[DH×D] (or equivalent, all 4×4×4).
+            // A addr = cnt (row-major), B addr = cnt. Simultaneous.
+            //   phase 0: dAttnOut = dY · Woᵀ      A=dY[t][d]          B=Wo_reg[dh][d] (Woᵀ[d][dh])
+            //   phase 1: dXq     = dQ · Wqᵀ       A=dQ[t][dh]         B=Wq_reg[d][dh] (Wqᵀ[dh][d])
+            //   phase 2: dXk     = dK · Wkᵀ       A=dK[t][dh]         B=Wk_reg[d][dh]
+            //   phase 3: dXv     = dV · Wvᵀ       A=dV[t][dh]         B=Wv_reg[d][dh]
+            BWD_BWM_LD: begin
+                bwm_a_wr_en   = 1'b1;
+                bwm_a_wr_addr = cnt[7:0];
+                bwm_b_wr_en   = 1'b1;
+                bwm_b_wr_addr = cnt[7:0];
+                case (bwd_phase)
+                    0: begin
+                        bwm_a_wr_data = dY_reg[cnt / D][cnt % D];
+                        bwm_b_wr_data = Wo_reg[cnt % DH][cnt / DH];   // Woᵀ[d][dh]=Wo[dh][d]
+                    end
+                    1: begin
+                        bwm_a_wr_data = dQ_reg[cnt / DH][cnt % DH];
+                        bwm_b_wr_data = Wq_reg[cnt % DH][cnt / DH];   // Wqᵀ[dh][d]=Wq[d][dh]
+                    end
+                    2: begin
+                        bwm_a_wr_data = dK_reg[cnt / DH][cnt % DH];
+                        bwm_b_wr_data = Wk_reg[cnt % DH][cnt / DH];
+                    end
+                    default: begin  // phase 3
+                        bwm_a_wr_data = dV_reg[cnt / DH][cnt % DH];
+                        bwm_b_wr_data = Wv_reg[cnt % DH][cnt / DH];
+                    end
+                endcase
+            end
+            BWD_BWM_RUN: bwm_start = 1'b1;
+
+            // ── Backward fp32_matmul load ──────────────────────────────────
+            // All loads: A and B both 4×4 FP32, addr=cnt simultaneous.
+            //   phase 0: dA   = dAttnOut · Vᵀ     A=dAttnOut[t][dh]   B=V[t'][dh'] stored as Vᵀ
+            //   phase 1: dV   = Aᵀ · dAttnOut     A=attn[k][i] as Aᵀ  B=dAttnOut[k][j]
+            //   phase 2: dQ   = dScores · K        A=dScores[t][t']    B=K[t'][dh]
+            //   phase 3: dK   = dScoresᵀ · Q       A=dScores[k][i] as Tᵀ B=Q[k][dh]
+            //   phase 4: dWo  = attnOutᵀ · dY      A=attnOut[k][i] as Tᵀ B=dY[k][d]
+            //   phase 5: dWq  = Xᵀ · dQ            A=X[k][i] as Xᵀ    B=dQ[k][dh]
+            //   phase 6: dWk  = Xᵀ · dK            A=X[k][i] as Xᵀ    B=dK[k][dh]
+            //   phase 7: dWv  = Xᵀ · dV            A=X[k][i] as Xᵀ    B=dV[k][dh]
+            BWD_FPM_LD: begin
+                fpm_a_wr_en   = 1'b1;
+                fpm_a_wr_addr = cnt[7:0];
+                fpm_b_wr_en   = 1'b1;
+                fpm_b_wr_addr = cnt[7:0];
+                case (bwd_phase)
+                    0: begin  // dA = dAttnOut · Vᵀ
+                        fpm_a_wr_data = dAttnOut_reg[cnt / DH][cnt % DH];
+                        fpm_b_wr_data = V_reg[cnt % T][cnt / T];          // Vᵀ[dh][t]=V[t][dh]
+                    end
+                    1: begin  // dV = Aᵀ · dAttnOut
+                        fpm_a_wr_data = attn_reg[cnt % T][cnt / T];       // Aᵀ[i][k]=A[k][i]
+                        fpm_b_wr_data = dAttnOut_reg[cnt / DH][cnt % DH];
+                    end
+                    2: begin  // dQ = dScores · K
+                        fpm_a_wr_data = dScores_reg[cnt / T][cnt % T];
+                        fpm_b_wr_data = K_reg[cnt / DH][cnt % DH];
+                    end
+                    3: begin  // dK = dScoresᵀ · Q
+                        fpm_a_wr_data = dScores_reg[cnt % T][cnt / T];    // dScoresᵀ[i][k]
+                        fpm_b_wr_data = Q_reg[cnt / DH][cnt % DH];
+                    end
+                    4: begin  // dWo = attnOutᵀ · dY
+                        fpm_a_wr_data = attnOut_reg[cnt % T][cnt / T];    // attnOutᵀ[i][k]
+                        fpm_b_wr_data = dY_reg[cnt / D][cnt % D];
+                    end
+                    5: begin  // dWq = Xᵀ · dQ
+                        fpm_a_wr_data = X_reg[cnt % T][cnt / T];          // Xᵀ[i][k]=X[k][i]
+                        fpm_b_wr_data = dQ_reg[cnt / DH][cnt % DH];
+                    end
+                    6: begin  // dWk = Xᵀ · dK
+                        fpm_a_wr_data = X_reg[cnt % T][cnt / T];
+                        fpm_b_wr_data = dK_reg[cnt / DH][cnt % DH];
+                    end
+                    default: begin  // phase 7: dWv = Xᵀ · dV
+                        fpm_a_wr_data = X_reg[cnt % T][cnt / T];
+                        fpm_b_wr_data = dV_reg[cnt / DH][cnt % DH];
+                    end
+                endcase
+            end
+            BWD_FPM_RUN: fpm_start = 1'b1;
+
             default: ;
         endcase
     end
 
     // -----------------------------------------------------------------------
-    // Output registers (set during OUT_WAIT from bwm outputs)
+    // Output registers — forward (out_valid) and backward (dx_valid)
     // -----------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst) begin
             out_valid   <= 1'b0;
             out_row     <= '0;
             out_row_idx <= '0;
+            dx_valid    <= 1'b0;
+            dx_row      <= '0;
+            dx_row_idx  <= '0;
         end else if (en) begin
-            out_valid <= 1'b0;  // default: not valid this cycle
+            out_valid <= 1'b0;
+            dx_valid  <= 1'b0;
             if (state == OUT_WAIT && bwm_c_valid) begin
                 out_row     <= bwm_c_row;
                 out_valid   <= 1'b1;
                 out_row_idx <= bwm_c_row_idx[$clog2(T)-1:0];
+            end
+            if (state == BWD_EMIT) begin
+                for (int j = 0; j < D; j++)
+                    dx_row[j*32 +: 32] <= dX_reg[cnt][j];
+                dx_row_idx <= cnt[$clog2(T)-1:0];
+                dx_valid   <= 1'b1;
+            end
+        end
+    end
+
+    // -----------------------------------------------------------------------
+    // Backward register collection
+    // -----------------------------------------------------------------------
+    always_ff @(posedge clk) begin
+        if (en) begin
+            // BWD_BWM_WAIT: collect bf16w_matmul outputs
+            if (state == BWD_BWM_WAIT && bwm_c_valid) begin
+                automatic int brow = int'(bwm_c_row_idx);
+                case (bwd_phase)
+                    0: // dAttnOut
+                        for (int j = 0; j < DH; j++)
+                            dAttnOut_reg[brow][j] <= bwm_c_row[j*32 +: 32];
+                    1: // dXq — init dX_reg
+                        for (int j = 0; j < D; j++)
+                            dX_reg[brow][j] <= bwm_c_row[j*32 +: 32];
+                    2: // dXk — accumulate into dX_reg
+                        for (int j = 0; j < D; j++)
+                            dX_reg[brow][j] <= $shortrealtobits(
+                                $bitstoshortreal(dX_reg[brow][j]) +
+                                $bitstoshortreal(bwm_c_row[j*32 +: 32]));
+                    default: // phase 3: dXv — accumulate
+                        for (int j = 0; j < D; j++)
+                            dX_reg[brow][j] <= $shortrealtobits(
+                                $bitstoshortreal(dX_reg[brow][j]) +
+                                $bitstoshortreal(bwm_c_row[j*32 +: 32]));
+                endcase
+            end
+
+            // BWD_FPM_WAIT: collect fp32_matmul outputs
+            if (state == BWD_FPM_WAIT && fpm_c_valid) begin
+                automatic int frow = int'(fpm_c_row_idx);
+                case (bwd_phase)
+                    0: for (int j = 0; j < T;  j++) dA_reg[frow][j]       <= fpm_c_row[j*32 +: 32];
+                    1: for (int j = 0; j < DH; j++) dV_reg[frow][j]       <= fpm_c_row[j*32 +: 32];
+                    2: for (int j = 0; j < DH; j++) dQ_reg[frow][j]       <= fpm_c_row[j*32 +: 32];
+                    3: for (int j = 0; j < DH; j++) dK_reg[frow][j]       <= fpm_c_row[j*32 +: 32];
+                    4: for (int j = 0; j < D;  j++) dWo_reg[frow][j]      <= fpm_c_row[j*32 +: 32];
+                    5: for (int j = 0; j < DH; j++) dWq_reg[frow][j]      <= fpm_c_row[j*32 +: 32];
+                    6: for (int j = 0; j < DH; j++) dWk_reg[frow][j]      <= fpm_c_row[j*32 +: 32];
+                    default: for (int j = 0; j < DH; j++) dWv_reg[frow][j] <= fpm_c_row[j*32 +: 32];
+                endcase
+            end
+
+            // BWD_SM_BACK: softmax backward element-wise + scale
+            // dScores[i][j] = A[i][j] * (dA[i][j] - dot_i) * SCALE_SR
+            if (state == BWD_SM_BACK) begin
+                for (int i = 0; i < T; i++) begin
+                    automatic shortreal dot_i = 0.0;
+                    for (int j = 0; j < T; j++)
+                        dot_i = dot_i + $bitstoshortreal(attn_reg[i][j])
+                                      * $bitstoshortreal(dA_reg[i][j]);
+                    for (int j = 0; j < T; j++)
+                        dScores_reg[i][j] <= $shortrealtobits(
+                            $bitstoshortreal(attn_reg[i][j])
+                            * ($bitstoshortreal(dA_reg[i][j]) - dot_i)
+                            * SCALE_SR);
+                end
             end
         end
     end
@@ -371,9 +582,10 @@ module attention_core #(
     // -----------------------------------------------------------------------
     always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
-            state  <= IDLE;
-            cnt    <= 0;
-            sm_row <= 0;
+            state     <= IDLE;
+            cnt       <= 0;
+            sm_row    <= 0;
+            bwd_phase <= 0;
         end else if (en) begin
             case (state)
 
@@ -382,6 +594,10 @@ module attention_core #(
                     if (start) begin
                         state <= Q_LD_A;
                         cnt   <= 0;
+                    end else if (bwd_start) begin
+                        bwd_phase <= 0;
+                        cnt       <= 0;
+                        state     <= BWD_BWM_LD;  // phase 0: dAttnOut = dY · Woᵀ
                     end
                 end
 
@@ -522,6 +738,65 @@ module attention_core #(
                 OUT_WAIT: begin
                     if (bwm_c_valid && int'(bwm_c_row_idx) == T - 1)
                         state <= IDLE;
+                end
+
+                // ============================================================
+                // BACKWARD STATES
+                // ============================================================
+                // BWD_BWM_LD: load A and B simultaneously into u_bwm.
+                // Both have 16 entries (TD = DDH = TDH = all 16 since T=D=DH=4).
+                BWD_BWM_LD: begin
+                    cnt <= cnt + 1;
+                    if (cnt == TD - 1) begin
+                        cnt   <= 0;
+                        state <= BWD_BWM_RUN;
+                    end
+                end
+                BWD_BWM_RUN: state <= BWD_BWM_WAIT;
+                BWD_BWM_WAIT: begin
+                    if (bwm_c_valid && int'(bwm_c_row_idx) == T - 1) begin
+                        cnt <= 0;
+                        case (bwd_phase)
+                            0: begin bwd_phase <= 0; state <= BWD_FPM_LD; end  // → dA
+                            1: begin bwd_phase <= 2; state <= BWD_BWM_LD; end  // → dXk
+                            2: begin bwd_phase <= 3; state <= BWD_BWM_LD; end  // → dXv
+                            default: state <= BWD_EMIT;                         // phase 3 done
+                        endcase
+                    end
+                end
+
+                // BWD_FPM_LD: load A and B simultaneously into u_fpm.
+                BWD_FPM_LD: begin
+                    cnt <= cnt + 1;
+                    if (cnt == TDH - 1) begin
+                        cnt   <= 0;
+                        state <= BWD_FPM_RUN;
+                    end
+                end
+                BWD_FPM_RUN: state <= BWD_FPM_WAIT;
+                BWD_FPM_WAIT: begin
+                    if (fpm_c_valid && int'(fpm_c_row_idx) == T - 1) begin
+                        cnt <= 0;
+                        case (bwd_phase)
+                            0: begin                 state <= BWD_SM_BACK; end  // → softmax bwd
+                            7: begin bwd_phase <= 1; state <= BWD_BWM_LD;  end  // → dXq
+                            default: begin bwd_phase <= bwd_phase + 1; state <= BWD_FPM_LD; end
+                        endcase
+                    end
+                end
+
+                // BWD_SM_BACK: softmax backward computed combinationally in the
+                // collection always_ff above. One cycle then move to FPM phase 1.
+                BWD_SM_BACK: begin
+                    bwd_phase <= 1;
+                    cnt       <= 0;
+                    state     <= BWD_FPM_LD;  // → dV
+                end
+
+                // BWD_EMIT: stream T rows of dX_reg; dx output driven by output always_ff.
+                BWD_EMIT: begin
+                    cnt <= cnt + 1;
+                    if (cnt == T - 1) state <= IDLE;
                 end
 
                 default: state <= IDLE;
