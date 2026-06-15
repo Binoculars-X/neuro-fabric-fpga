@@ -197,7 +197,12 @@ module transformer #(
         .wff1_wr_en(mlp_wff1_wr_en), .wff1_wr_addr(mlp_wff1_wr_addr), .wff1_wr_data(mlp_wff1_wr_data),
         .wff2_wr_en(mlp_wff2_wr_en), .wff2_wr_addr(mlp_wff2_wr_addr), .wff2_wr_data(mlp_wff2_wr_data),
         .start(mlp_start),
-        .out_row(mlp_out_row), .out_valid(mlp_out_valid), .out_row_idx(mlp_out_row_idx)
+        .out_row(mlp_out_row), .out_valid(mlp_out_valid), .out_row_idx(mlp_out_row_idx),
+        // Backward ports — not yet wired (7b-iv will connect)
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dWff1_flat(), .dWff2_flat()
     );
 
     fp32_matmul #(.M(T), .K(D), .N(V), .MUL_LATENCY(MUL_LAT)) u_proj (

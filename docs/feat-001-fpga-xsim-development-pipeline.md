@@ -386,7 +386,19 @@ ApplyAdam(all weights)                -- adam_core.sv per weight matrix
   - Tolerance: `VsSoftwareRelTol` (0.01%) — same discipline as all other primary XSim tests.
   - `TransformerVsSoftwareTests.cs`: 2 seeds × (RTL vs `bus.Forward()`) = 2 tests, also passing at `VsSoftwareRelTol`.
 
-**7b** — Single train step: add backward path + `adam_core` instances. One token sequence, one step.
+**7b** — Single train step: forward + backward + Adam. Decomposed into 5 sub-steps, each verified before the next:
+
+**7b-i. `mlp_core.sv` backward** — add `bwd_start` + `dy_wr_*` input ports, `dx_row`/`dx_valid`/`dWff1`/`dWff2` output ports. New FSM states `BWD_LD_DY`, `BWD_DW2`, `BWD_GELU_GRAD`, `BWD_DW1`, `BWD_DX` reuse the single `u_bwm` instance already present. GeLU gradient: `dGeLU(h) = 0.5·(1 + tanh(c·(h + 0.044715·h³))) + 0.5·h·(1-tanh²(·))·c·(1 + 3·0.044715·h²)` — computed in `shortreal` per element (no new primitives). Verified by `MlpCoreBackwardTests.cs` (C# oracle: `AttentionLayer.Backward` FF sub-path at `VsSoftwareRelTol`).
+
+**7b-ii. `attention_core.sv` backward** — add `bwd_start` + `dy_wr_*`, output `dx_row`/`dx_valid`/`dWq`/`dWk`/`dWv`/`dWo`. New FSM states reuse `u_bwm` and `u_fpm`. Softmax backward: `dS[i][j] = A[i][j] · (dZ[i][j] - Σ_k A[i][k]·dZ[i][k])` — computed row-by-row in a new `BWD_SM` state, purely in `shortreal`. Scale `dS` by `1/√DH`. Verified by `AttentionCoreBackwardTests.cs` (C# oracle: `AttentionCore.Backward` at `VsSoftwareRelTol`).
+
+**7b-iii. `layernorm.sv` backward** — add `bwd_start` + `dy_wr_*`, output `dx_row`/`dx_valid`/`dGamma`/`dBeta`. New FSM states (reuse existing `x_buf`, need to retain `mean`/`invStd` from forward pass — add latched registers). Formula matches `LayerNorm.Backward()` in C#. Verified by `LayerNormBackwardTests.cs` (C# oracle: `LayerNorm.Backward` at `VsSoftwareRelTol`).
+
+**7b-iv. `transformer.sv` train FSM** — extend FSM with `BACKWARD` + `ADAM_UPDATE` states. After `DONE_ST` (forward), enter `BWD_L1` / `BWD_L0` states: for each layer in reverse, feed `dx` through `u_att.bwd_*` + `u_mlp.bwd_*` + `u_ln.bwd_*` in order. Add 12 `adam_core` instances (Wq/Wk/Wv/Wo/Wff1/Wff2 × 2 layers) plus 1 for embedding. Adam state registers (w_bf16, m, v) loaded via extended write bus. `bc1`/`bc2` computed from `step` register. New write bus addresses: Adam state (m, v per weight) starting at 0x130. New read bus: dump updated w_bf16/m/v after `ADAM_DONE`. Verified by `TransformerTrainTests.cs`.
+
+**7b-v. `tb_transformer_train.sv` + `TransformerTrainTests.cs`** — new testbench reads extended `input.hex` (304 weights + 8 tokens/targets + Adam initial state), asserts `train_start`, waits for `adam_done`, dumps updated w_bf16/m/v to `output.hex`. `TransformerTrainTests.cs`: 2 seeds × updated weights vs C# oracle at `VsSoftwareRelTol` / `AdamMomentAbsTol`.
+
+> **C# infrastructure done** (this session): `BuildTrainStep(seed, lr)` + `WriteHexTrain(moduleDir, v)` in `FpgaTransformerVecGen.cs`. `AdamBF16WeightsAttentionLayer.GetState(w, i, j)` + `AdamBF16WeightsEmbeddingLayer.GetAllState()` added.
 
 **7c** — 10 steps: same testbench, loop, compare final state only.
 
