@@ -394,13 +394,34 @@ ApplyAdam(all weights)                -- adam_core.sv per weight matrix
 
 **7b-iii. `layernorm.sv` backward** — add `bwd_start` + `dy_wr_*`, output `dx_row`/`dx_valid`/`dGamma`/`dBeta`. New FSM states (reuse existing `x_buf`, need to retain `mean`/`invStd` from forward pass — add latched registers). Formula matches `LayerNorm.Backward()` in C#. Verified by `LayerNormBackwardTests.cs` (C# oracle: `LayerNorm.Backward` at `VsSoftwareRelTol`).
 
-**7b-iv. `transformer.sv` train FSM** — extend FSM with `BACKWARD` + `ADAM_UPDATE` states. After `DONE_ST` (forward), enter `BWD_L1` / `BWD_L0` states: for each layer in reverse, feed `dx` through `u_att.bwd_*` + `u_mlp.bwd_*` + `u_ln.bwd_*` in order. Add 12 `adam_core` instances (Wq/Wk/Wv/Wo/Wff1/Wff2 × 2 layers) plus 1 for embedding. Adam state registers (w_bf16, m, v) loaded via extended write bus. `bc1`/`bc2` computed from `step` register. New write bus addresses: Adam state (m, v per weight) starting at 0x130. New read bus: dump updated w_bf16/m/v after `ADAM_DONE`. Verified by `TransformerTrainTests.cs`.
+if we generate . `transformer.sv` train FSM** — extend FSM with `BACKWARD` + `ADAM_UPDATE` states. After `DONE_ST` (forward), enter `BWD_L1` / `BWD_L0` states: for each layer in reverse, feed `dx` through `u_att.bwd_*` + `u_mlp.bwd_*` + `u_ln.bwd_*` in order. Add 12 `adam_core` instances (Wq/Wk/Wv/Wo/Wff1/Wff2 × 2 layers) plus 1 for embedding. Adam state registers (w_bf16, m, v) loaded via extended write bus. `bc1`/`bc2` computed from `step` register. New write bus addresses: Adam state (m, v per weight) starting at 0x130. New read bus: dump updated w_bf16/m/v after `ADAM_DONE`. Verified by `TransformerTrainTests.cs`.
 
 **7b-v. `tb_transformer_train.sv` + `TransformerTrainTests.cs`** — new testbench reads extended `input.hex` (304 weights + 8 tokens/targets + Adam initial state), asserts `train_start`, waits for `adam_done`, dumps updated w_bf16/m/v to `output.hex`. `TransformerTrainTests.cs`: 2 seeds × updated weights vs C# oracle at `VsSoftwareRelTol` / `AdamMomentAbsTol`.
 
 > **C# infrastructure done** (this session): `BuildTrainStep(seed, lr)` + `WriteHexTrain(moduleDir, v)` in `FpgaTransformerVecGen.cs`. `AdamBF16WeightsAttentionLayer.GetState(w, i, j)` + `AdamBF16WeightsEmbeddingLayer.GetAllState()` added.
 
-**7c** — 10 steps: same testbench, loop, compare final state only.
+**7c — Split-injection train step tests** (break the end-to-end x87 error chain):
+
+The end-to-end `TransformerTrainTests` fails because x87 80-bit `shortreal` accumulation through forward → CE → backward → Adam accumulates enough error to flip a BF16 rounding boundary (~7 ULPs). The fix is to inject C#-computed intermediates at each stage boundary, isolating each RTL block from upstream x87 drift.
+
+**7c-i. CE + clip in isolation** (`TransformerCeTests.cs`):
+- C# writes logits[T×V] + targets[T] to `input.hex`; RTL runs only CE states → dumps dLogits[T×V] to `output.hex`
+- Compare dLogits to `TransformerBus.TrainStep` CE output (before backward) at `VsSoftwareRelTol`
+- Requires: new testbench mode (or separate `tb_transformer_ce.sv`) that stops after `CE_CLIP_APPLY`
+
+**7c-ii. Backward-only in isolation** (`TransformerBackwardTests.cs`):
+- C# writes: all weights + C#-computed `dLogits` (post-clip) to `input.hex`; RTL runs backward only → dumps per-layer dWff1/dWff2/dWq/dWk/dWv/dWo to `output.hex`
+- Compare gradients to C# `AttentionLayer.Backward` sub-path at `VsSoftwareRelTol`
+- No forward pass → no accumulated x87 error entering the backward
+
+**7c-iii. Adam-only in isolation** (`TransformerAdamTests.cs`):
+- C# writes: initial w_bf16/m/v + C#-computed gradients (same as adam_core tests but for all 13 matrices simultaneously) to `input.hex`; RTL runs Adam only → dumps updated w_bf16/m/v
+- Compare final weights to `AdamBF16WeightsAttentionCore.ApplyUpdate()` at `VsSoftwareRelTol`
+- No forward or backward → no accumulated x87 error entering Adam
+
+This mirrors the existing isolation discipline (MlpCoreBackwardTests, AdamCoreTests etc.) applied at the transformer level.
+
+**8** — 10 steps: same testbench, loop, compare final state only.
 
 ## Cross-repo test flow
 

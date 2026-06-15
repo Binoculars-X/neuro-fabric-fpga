@@ -105,9 +105,20 @@ module transformer_train #(
     logic [31:0]  dLogits_reg [0:T-1][0:V-1];    // computed dLogits (FP32 bits)
     shortreal     max_logit_sr;                   // per-row softmax stability max
     shortreal     exp_sum_sr;                     // exp accumulator
-    shortreal     exp_buf_sr   [0:V-1];           // per-row exp values
+    logic [31:0]  exp_buf_fp32 [0:V-1];          // per-row exp values (FP32 bits from exp_lut)
     shortreal     grad_norm_sq_sr;                // ||dLogits||^2
     shortreal     clip_scale_sr;                  // 1.0 or 1/||dLogits||
+
+    // exp_lut instance signals (CE softmax)
+    logic [31:0]  ce_exp_x_reg;
+    logic         ce_exp_valid_in_reg;
+    logic [31:0]  ce_exp_result_fp32;
+    logic         ce_exp_valid_out;
+    logic [4:0]   ce_coll_idx;        // 5-bit to compare with V=16
+
+    // fp32_sqrt instance signals (grad norm clip)
+    logic [31:0]  ce_sqrt_result_fp32;
+    logic [31:0]  ce_sqrt_in_fp32;
 
     // Intermediate gradient buffers (reused across backward phases)
     logic [31:0] dx_buf   [0:T-1][0:D-1];   // current gradient propagating backward
@@ -288,6 +299,24 @@ module transformer_train #(
         .c_row(projCRow), .c_valid(projCValid), .c_row_idx(projCIdx)
     );
 
+    // exp_lut for cross-entropy softmax (one element per cycle, EXP_LAT pipeline)
+    exp_lut #(.LUT_SIZE(LUT_SIZE), .LUT_FILE(LUT_FILE)) u_ce_exp (
+        .clk         (clk),
+        .rst         (rst),
+        .en          (1'b1),
+        .x_fp32      (ce_exp_x_reg),
+        .valid_in    (ce_exp_valid_in_reg),
+        .result_fp32 (ce_exp_result_fp32),
+        .valid_out   (ce_exp_valid_out)
+    );
+
+    // fp32_sqrt for grad-norm clipping (combinatorial: 1/sqrt(grad_norm_sq))
+    assign ce_sqrt_in_fp32 = $shortrealtobits(grad_norm_sq_sr);
+    fp32_sqrt u_ce_sqrt (
+        .x_fp32      (ce_sqrt_in_fp32),
+        .result_fp32 (ce_sqrt_result_fp32)
+    );
+
     // -----------------------------------------------------------------------
     // Adam cores
     // All grad inputs wired directly from backward module output ports.
@@ -460,7 +489,8 @@ module transformer_train #(
         BWD_L0_LN1_DY, BWD_L0_LN1_START, BWD_L0_LN1_WAIT, BWD_L0_LN1_RESID,
         // Cross-entropy backward (compute dLogits, dX_init, dWout inside RTL)
         CE_ROW_MAX,         // find max logit per token row (V cycles)
-        CE_ROW_EXP,         // compute exp(logit-max), accumulate sum (V cycles)
+        CE_ROW_EXP_FEED,    // feed logit-max to exp_lut (V cycles; collection via ce_coll_idx)
+        CE_ROW_EXP_DRAIN,   // drain last EXP_LAT+1 results (EXP_LAT+1 cycles)
         CE_ROW_NORM,        // normalise → dLogits, subtract 1 at target (V cycles)
         CE_DIV_T,           // divide all dLogits by T (T*V cycles)
         CE_GRADNORM,        // sum dLogits^2 (T*V cycles)
@@ -652,8 +682,17 @@ module transformer_train #(
             state <= IDLE; cnt <= '0; ln_row <= '0;
             done <= 1'b0; out_valid <= 1'b0; out_row <= '0; out_row_idx <= '0;
             adam_done <= 1'b0;
+            ce_exp_valid_in_reg <= 1'b0; ce_exp_x_reg <= '0; ce_coll_idx <= '0;
         end else if (en) begin
             done <= 1'b0; out_valid <= 1'b0; adam_done <= 1'b0;
+            ce_exp_valid_in_reg <= 1'b0;   // default: no feed
+
+            // Collect exp_lut results whenever valid_out fires (any state)
+            if (ce_exp_valid_out && ce_coll_idx < 5'(V)) begin
+                exp_buf_fp32[ce_coll_idx[3:0]] <= ce_exp_result_fp32;
+                exp_sum_sr                     <= exp_sum_sr + $bitstoshortreal(ce_exp_result_fp32);
+                ce_coll_idx                    <= ce_coll_idx + 1;
+            end
 
             case (state)
                 IDLE: if (start) begin
@@ -907,26 +946,31 @@ module transformer_train #(
                         if (cnt[3:0] == '0) max_logit_sr <= lv;
                         else if (lv > max_logit_sr) max_logit_sr <= lv;
                     end
-                    if (cnt[3:0] == 4'(V-1)) begin cnt <= '0; exp_sum_sr <= 0.0; state <= CE_ROW_EXP; end
+                    if (cnt[3:0] == 4'(V-1)) begin cnt <= '0; ce_coll_idx <= '0; exp_sum_sr <= 0.0; state <= CE_ROW_EXP_FEED; end
                     else cnt <= cnt + 1;
                 end
 
-                //   Step 2: compute exp(logit - max), accumulate sum
-                CE_ROW_EXP: begin
+                //   Step 2a: feed V logit-max values to exp_lut
+                CE_ROW_EXP_FEED: begin
                     begin
                         automatic shortreal lv = $bitstoshortreal(logits_reg[ln_row][cnt[3:0]]);
-                        automatic shortreal e  = $exp(lv - max_logit_sr);
-                        exp_buf_sr[cnt[3:0]] <= e;
-                        exp_sum_sr <= exp_sum_sr + e;
+                        ce_exp_x_reg        <= $shortrealtobits(lv - max_logit_sr);
+                        ce_exp_valid_in_reg <= 1'b1;
                     end
-                    if (cnt[3:0] == 4'(V-1)) begin cnt <= '0; state <= CE_ROW_NORM; end
+                    if (cnt[3:0] == 4'(V-1)) begin cnt <= '0; state <= CE_ROW_EXP_DRAIN; end
+                    else cnt <= cnt + 1;
+                end
+
+                //   Step 2b: drain EXP_LAT+1 results (+1 for registered valid_in)
+                CE_ROW_EXP_DRAIN: begin
+                    if (cnt == 7'(EXP_LAT)) begin cnt <= '0; state <= CE_ROW_NORM; end
                     else cnt <= cnt + 1;
                 end
 
                 //   Step 3: dLogits[t][v] = exp/sum; subtract 1 at target
                 CE_ROW_NORM: begin
                     begin
-                        automatic shortreal dl = exp_buf_sr[cnt[3:0]] / exp_sum_sr;
+                        automatic shortreal dl = $bitstoshortreal(exp_buf_fp32[cnt[3:0]]) / exp_sum_sr;
                         if (cnt[3:0] == 4'(targets_reg[ln_row])) dl = dl - 1.0;
                         dLogits_reg[ln_row][cnt[3:0]] <= $shortrealtobits(dl);
                     end
@@ -935,7 +979,7 @@ module transformer_train #(
                             cnt <= '0; state <= CE_DIV_T;   // all rows done
                         end else begin
                             ln_row <= ln_row + 1;
-                            cnt <= '0; max_logit_sr <= 0.0; exp_sum_sr <= 0.0;
+                            cnt <= '0; ce_coll_idx <= '0; max_logit_sr <= 0.0; exp_sum_sr <= 0.0;
                             state <= CE_ROW_MAX;
                         end
                     end else cnt <= cnt + 1;
@@ -961,12 +1005,12 @@ module transformer_train #(
                     else cnt <= cnt + 1;
                 end
 
-                // Compute clip_scale (1 cycle)
+                // Compute clip_scale (1 cycle, fp32_sqrt gives 1/sqrt(grad_norm_sq))
                 CE_CLIP: begin
-                    begin
-                        automatic shortreal gnorm = $sqrt(grad_norm_sq_sr);
-                        clip_scale_sr <= (gnorm > 1.0) ? (1.0 / gnorm) : 1.0;
-                    end
+                    if (grad_norm_sq_sr > 1.0)
+                        clip_scale_sr <= $bitstoshortreal(ce_sqrt_result_fp32);
+                    else
+                        clip_scale_sr <= 1.0;
                     cnt <= '0; state <= CE_CLIP_APPLY;
                 end
 
