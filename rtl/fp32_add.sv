@@ -142,7 +142,6 @@ module fp32_add (
     logic        s2_nan, s2_inf, s2_inf_sign, s2_sign_large;
     logic [7:0]  s2_exp_large;
     logic [25:0] s2_sum;
-    logic        s2_sticky;  // sticky bit: OR of all bits shifted out during alignment
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -155,7 +154,6 @@ module fp32_add (
             s2_sign_large <= s1_sign_large;
             s2_exp_large  <= s1_exp_large;
             s2_sum        <= c2_sum;
-            s2_sticky     <= c2_sticky;
         end
     end
 
@@ -187,7 +185,7 @@ module fp32_add (
             // Normalised
             c3_mant_raw   = c3_norm_sum[23:1];
             c3_round_bit  = c3_norm_sum[0];
-            c3_sticky_bit = s2_sticky;          // carry sticky from Stage 2
+            c3_sticky_bit = 1'b0;
             c3_exp_adj    = {1'b0, s2_exp_large};
         end else begin
             // Subtraction cancellation — priority encode leading 1 (low-to-high so highest wins)
@@ -197,7 +195,7 @@ module fp32_add (
             c3_norm_sum  = c3_norm_sum << c3_lz;
             c3_mant_raw  = c3_norm_sum[23:1];
             c3_round_bit = c3_norm_sum[0];
-            c3_sticky_bit = 1'b0;               // bits shifted in are zeros (left-shift)
+            c3_sticky_bit = 1'b0;
             c3_exp_adj   = {1'b0, s2_exp_large} - {4'b0, c3_lz};
         end
 
@@ -205,12 +203,9 @@ module fp32_add (
         c3_mant_rounded = {1'b0, c3_mant_raw} + {23'h0, c3_round_up};
 
         if (c3_mant_rounded[23]) begin
-            // Mantissa overflowed on rounding — it's now 0x800000, which is 1.0 in normalized form
-            // After implicit right-shift, this becomes {1.000...000}, mantissa bits are all 0, exp+1
-            c3_mant_out = 23'h0;  // Mantissa is all zeros after overflow
+            c3_mant_out = c3_mant_rounded[22:0];
             c3_exp_out  = c3_exp_adj + 9'd1;
         end else begin
-            // No overflow — mantissa fits in 23 bits
             c3_mant_out = c3_mant_rounded[22:0];
             c3_exp_out  = c3_exp_adj;
         end
