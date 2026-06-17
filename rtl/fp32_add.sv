@@ -117,7 +117,8 @@ module fp32_add (
 
     // =========================================================================
     // Stage 2 combinatorial — align smaller, add/subtract
-    // sum[25]=carry, sum[24]=leading-1, sum[23:2]=mant, sum[1]=round, sum[0]=sticky
+    // sum[25]=carry, sum[24]=leading-1, sum[23:1]=mant, sum[0]=round
+    // Alignment sticky is pipelined separately as s2_sticky for correct IEEE 754 RNE.
     // =========================================================================
 
     logic [25:0] c2_small_pre;
@@ -127,9 +128,11 @@ module fp32_add (
 
     always_comb begin
         c2_small_pre           = {s1_mant_small, 1'b0};
+        // sticky = any bit shifted out during alignment (bits below the guard position)
         c2_sticky              = |(c2_small_pre & ((26'h1 << s1_exp_diff) - 26'h1));
+        // Do NOT fold sticky into bit 0 — keep aligned mantissa exact so the sum
+        // preserves the round bit in sum[0]; sticky is pipelined separately.
         c2_mant_small_aligned  = c2_small_pre[25:1] >> s1_exp_diff;
-        c2_mant_small_aligned[0] = c2_mant_small_aligned[0] | c2_sticky;
 
         if (s1_eff_sub)
             c2_sum = {1'b0, s1_mant_large} - {1'b0, c2_mant_small_aligned};
@@ -142,6 +145,7 @@ module fp32_add (
     logic        s2_nan, s2_inf, s2_inf_sign, s2_sign_large;
     logic [7:0]  s2_exp_large;
     logic [25:0] s2_sum;
+    logic        s2_sticky;  // alignment sticky carried separately for correct RNE
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -154,6 +158,7 @@ module fp32_add (
             s2_sign_large <= s1_sign_large;
             s2_exp_large  <= s1_exp_large;
             s2_sum        <= c2_sum;
+            s2_sticky     <= c2_sticky;
         end
     end
 
@@ -176,16 +181,16 @@ module fp32_add (
         c3_lz       = 5'd24;
 
         if (c3_norm_sum[25]) begin
-            // Carry-out: exp+1, shift right
-            c3_mant_raw  = c3_norm_sum[24:2];
-            c3_round_bit = c3_norm_sum[1];
-            c3_sticky_bit = c3_norm_sum[0];
-            c3_exp_adj   = {1'b0, s2_exp_large} + 9'd1;
+            // Carry-out: exp+1, shift right by 1 — round=bit1, sticky=bit0|alignment_sticky
+            c3_mant_raw   = c3_norm_sum[24:2];
+            c3_round_bit  = c3_norm_sum[1];
+            c3_sticky_bit = c3_norm_sum[0] | s2_sticky;
+            c3_exp_adj    = {1'b0, s2_exp_large} + 9'd1;
         end else if (c3_norm_sum[24]) begin
-            // Normalised
+            // Normalised — round=bit0, sticky=alignment_sticky
             c3_mant_raw   = c3_norm_sum[23:1];
             c3_round_bit  = c3_norm_sum[0];
-            c3_sticky_bit = 1'b0;
+            c3_sticky_bit = s2_sticky;
             c3_exp_adj    = {1'b0, s2_exp_large};
         end else begin
             // Subtraction cancellation — priority encode leading 1 (low-to-high so highest wins)

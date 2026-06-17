@@ -7,7 +7,7 @@
 // Architecture: identical to bf16_matmul but uses bf16w_mac internally.
 //   K×N bf16w_mac units in parallel (c_fp32=0: pure product)
 //   2-stage FP32 adder tree (K=4): (p0+p1) + (p2+p3)
-//   Total latency = MAC_LATENCY + 2 = 9 cycles (defaults)
+//   Total latency = MAC_LATENCY + ADD_TREE_LAT = 7 + 8 = 15 cycles (defaults)
 //
 // Matrix load protocol:
 //   A: a_wr_en/a_wr_addr/a_wr_data  — FP32, addr = row*K + col
@@ -23,7 +23,8 @@ module bf16w_matmul #(
     parameter int M           = 4,
     parameter int K           = 4,
     parameter int N           = 4,
-    parameter int MAC_LATENCY = 7
+    parameter int MAC_LATENCY  = 7,
+    parameter int ADD_TREE_LAT = 8
 )(
     input  logic clk,
     input  logic rst,
@@ -46,8 +47,7 @@ module bf16w_matmul #(
     output logic [1:0]      c_row_idx
 );
 
-    localparam int ADD_STAGES = 2;
-    localparam int TOTAL_LAT  = MAC_LATENCY + ADD_STAGES;
+    localparam int TOTAL_LAT  = MAC_LATENCY + ADD_TREE_LAT;
 
     // -----------------------------------------------------------------------
     // Register files
@@ -112,42 +112,26 @@ module bf16w_matmul #(
     endgenerate
 
     // -----------------------------------------------------------------------
-    // Adder tree (K=4, 2 stages)
+    // Adder tree: N fp32_add_tree instances (one per output column)
+    // Each sums K=4 products: mac_prod[0..3][j]; latency = 8 cycles
     // -----------------------------------------------------------------------
-    logic [31:0] add1 [0:N-1][0:1];
-    logic        add1_v;
-    logic [31:0] add2 [0:N-1];
-    logic        add2_v;
+    logic [31:0] tree_sum   [0:N-1];
+    logic        tree_valid [0:N-1];
 
-    shortreal tmp_p, tmp_q, tmp_r;
-
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            add1_v <= 0;
-            add2_v <= 0;
-        end else if (en) begin
-            add1_v <= mac_valid[0][0];
-            for (int jj = 0; jj < N; jj++) begin
-                tmp_p = $bitstoshortreal(mac_prod[0][jj]);
-                tmp_q = $bitstoshortreal(mac_prod[1][jj]);
-                tmp_r = tmp_p + tmp_q;
-                add1[jj][0] <= $shortrealtobits(tmp_r);
-
-                tmp_p = $bitstoshortreal(mac_prod[2][jj]);
-                tmp_q = $bitstoshortreal(mac_prod[3][jj]);
-                tmp_r = tmp_p + tmp_q;
-                add1[jj][1] <= $shortrealtobits(tmp_r);
-            end
-
-            add2_v <= add1_v;
-            for (int jj = 0; jj < N; jj++) begin
-                tmp_p = $bitstoshortreal(add1[jj][0]);
-                tmp_q = $bitstoshortreal(add1[jj][1]);
-                tmp_r = tmp_p + tmp_q;
-                add2[jj] <= $shortrealtobits(tmp_r);
-            end
+    genvar gt;
+    generate
+        for (gt = 0; gt < N; gt++) begin : gen_tree
+            fp32_add_tree #(.T(4)) u_tree (
+                .clk      (clk),
+                .rst      (rst),
+                .valid_in (mac_valid[0][gt]),
+                .in_vec   ({mac_prod[3][gt], mac_prod[2][gt],
+                            mac_prod[1][gt], mac_prod[0][gt]}),
+                .sum_out  (tree_sum[gt]),
+                .valid_out(tree_valid[gt])
+            );
         end
-    end
+    endgenerate
 
     // -----------------------------------------------------------------------
     // Row index pipeline
@@ -168,10 +152,10 @@ module bf16w_matmul #(
     // Output
     // -----------------------------------------------------------------------
     always_comb begin
-        c_valid   = add2_v;
+        c_valid   = tree_valid[0];
         c_row_idx = row_pipe[TOTAL_LAT-1];
         for (int jj = 0; jj < N; jj++)
-            c_row[jj*32 +: 32] = add2[jj];
+            c_row[jj*32 +: 32] = tree_sum[jj];
     end
 
 endmodule
