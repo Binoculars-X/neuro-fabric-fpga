@@ -40,7 +40,8 @@ module bf16_matmul #(
     parameter int M           = 4,
     parameter int K           = 4,   // inner dimension; adder tree requires K=4
     parameter int N           = 4,
-    parameter int MAC_LATENCY = 3
+    parameter int MAC_LATENCY  = 7,   // must match bf16_mac LATENCY
+    parameter int ADD_TREE_LAT = 8    // must match fp32_add_tree latency
 )(
     input  logic clk,
     input  logic rst,
@@ -62,11 +63,10 @@ module bf16_matmul #(
     // One row of C (FP32) per clock, valid for M consecutive cycles
     output logic [N*32-1:0] c_row,       // c_row[j*32 +: 32] = C[row][j]
     output logic            c_valid,
-    output logic [1:0]      c_row_idx    // row index of c_row ($clog2(M)=2 for M=4)
+    output logic [1:0]      c_row_idx    // row index of c_row
 );
 
-    localparam int ADD_STAGES = 2;                    // ceil(log2(4)) — K=4 only
-    localparam int TOTAL_LAT  = MAC_LATENCY + ADD_STAGES;  // 5 for defaults
+    localparam int TOTAL_LAT = MAC_LATENCY + ADD_TREE_LAT;  // 15 for defaults
 
     // -----------------------------------------------------------------------
     // Register files: A[M][K] and B[K][N], BF16
@@ -140,52 +140,27 @@ module bf16_matmul #(
     endgenerate
 
     // -----------------------------------------------------------------------
-    // Adder tree: K=4 → 2 pipeline stages
-    //
-    // Stage 1: pair-sum (registered)
-    //   add1[j][0] = mac_prod[0][j] + mac_prod[1][j]
-    //   add1[j][1] = mac_prod[2][j] + mac_prod[3][j]
-    //
-    // Stage 2: final sum (registered)
-    //   add2[j] = add1[j][0] + add1[j][1]
+    // Adder tree: N fp32_add_tree instances (one per output column)
+    // Each sums K=4 products: mac_prod[0..3][j]
+    // fp32_add_tree latency = 8 cycles
     // -----------------------------------------------------------------------
-    logic [31:0] add1 [0:N-1][0:1];
-    logic        add1_v;
-    logic [31:0] add2 [0:N-1];
-    logic        add2_v;
+    logic [31:0] tree_sum   [0:N-1];
+    logic        tree_valid [0:N-1];
 
-    // Shortreal temporaries for FP32 addition (module scope — no 'automatic' needed)
-    shortreal tmp_p, tmp_q, tmp_r;
-
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            add1_v <= 0;
-            add2_v <= 0;
-        end else if (en) begin
-            // Stage 1
-            add1_v <= mac_valid[0][0];   // all MACs have identical valid timing
-            for (int jj = 0; jj < N; jj++) begin
-                tmp_p = $bitstoshortreal(mac_prod[0][jj]);
-                tmp_q = $bitstoshortreal(mac_prod[1][jj]);
-                tmp_r = tmp_p + tmp_q;
-                add1[jj][0] <= $shortrealtobits(tmp_r);
-
-                tmp_p = $bitstoshortreal(mac_prod[2][jj]);
-                tmp_q = $bitstoshortreal(mac_prod[3][jj]);
-                tmp_r = tmp_p + tmp_q;
-                add1[jj][1] <= $shortrealtobits(tmp_r);
-            end
-
-            // Stage 2
-            add2_v <= add1_v;
-            for (int jj = 0; jj < N; jj++) begin
-                tmp_p = $bitstoshortreal(add1[jj][0]);
-                tmp_q = $bitstoshortreal(add1[jj][1]);
-                tmp_r = tmp_p + tmp_q;
-                add2[jj] <= $shortrealtobits(tmp_r);
-            end
+    genvar gt;
+    generate
+        for (gt = 0; gt < N; gt++) begin : gen_tree
+            fp32_add_tree #(.T(4)) u_tree (
+                .clk      (clk),
+                .rst      (rst),
+                .valid_in (mac_valid[0][gt]),
+                .in_vec   ({mac_prod[3][gt], mac_prod[2][gt],
+                            mac_prod[1][gt], mac_prod[0][gt]}),
+                .sum_out  (tree_sum[gt]),
+                .valid_out(tree_valid[gt])
+            );
         end
-    end
+    endgenerate
 
     // -----------------------------------------------------------------------
     // Row-index pipeline: shift TOTAL_LAT stages so c_row_idx matches c_row
@@ -206,10 +181,10 @@ module bf16_matmul #(
     // Output
     // -----------------------------------------------------------------------
     always_comb begin
-        c_valid   = add2_v;
+        c_valid   = tree_valid[0];
         c_row_idx = row_pipe[TOTAL_LAT-1];
         for (int jj = 0; jj < N; jj++)
-            c_row[jj*32 +: 32] = add2[jj];
+            c_row[jj*32 +: 32] = tree_sum[jj];
     end
 
 endmodule

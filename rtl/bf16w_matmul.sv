@@ -7,7 +7,7 @@
 // Architecture: identical to bf16_matmul but uses bf16w_mac internally.
 //   K×N bf16w_mac units in parallel (c_fp32=0: pure product)
 //   2-stage FP32 adder tree (K=4): (p0+p1) + (p2+p3)
-//   Total latency = MAC_LATENCY + 2 = 5 cycles (defaults)
+//   Total latency = MAC_LATENCY + 2 = 9 cycles (defaults)
 //
 // Matrix load protocol:
 //   A: a_wr_en/a_wr_addr/a_wr_data  — FP32, addr = row*K + col
@@ -23,7 +23,7 @@ module bf16w_matmul #(
     parameter int M           = 4,
     parameter int K           = 4,
     parameter int N           = 4,
-    parameter int MAC_LATENCY = 3
+    parameter int MAC_LATENCY = 7
 )(
     input  logic clk,
     input  logic rst,

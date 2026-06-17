@@ -12,7 +12,7 @@
 //
 // Comparison: 1-ULP tolerance. C# reference uses ReferenceExactHardwareMode:
 // every operation is (float)((double)x op (double)y), matching XSim shortreal promotion.
-// Parameters: M=4, K=4, N=4, MAC_LATENCY=3, TOTAL_LAT=5.
+// Parameters: M=4, K=4, N=4, MAC_LATENCY=7, TOTAL_LAT=9.
 
 `timescale 1ns/1ps
 
@@ -21,7 +21,7 @@ module tb_bf16w_matmul;
     localparam int M           = 4;
     localparam int K           = 4;
     localparam int N           = 4;
-    localparam int MAC_LATENCY = 3;
+    localparam int MAC_LATENCY = 7;
     localparam int ADD_STAGES  = 2;
     localparam int TOTAL_LAT   = MAC_LATENCY + ADD_STAGES;
 

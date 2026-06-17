@@ -1,7 +1,7 @@
 # FEAT-002 — RTL Synthesizable Rewrite (Remove shortreal Tech Debt)
 
 ## Status
-In progress — `fp32_mul.sv` ✅  `fp32_add.sv` ✅  remaining modules queued
+In progress — `fp32_mul.sv` ✅  `fp32_add.sv` ✅  `fp32_sqrt.sv` ✅  `fp32_div.sv` ✅  `fp32_add_tree.sv` ✅  remaining modules queued
 
 ## Context
 
@@ -172,9 +172,11 @@ Tests: `TransformerTests.cs` + `TransformerTrainTests.cs` + VsSoftware variants.
 - [x] Copilot instructions updated with synthesizable subset + ZCU102 target
 - [x] `fp32_sqrt.sv` rewrite
 - [x] `fp32_div.sv` rewrite
-- [ ] `fp32_add_tree.sv` rewrite
-- [ ] `bf16_mac.sv` / `bf16w_mac.sv` rewrite
-- [ ] `bf16_matmul.sv` / `bf16w_matmul.sv` / `fp32_matmul.sv` rewrite
+- [x] `fp32_add_tree.sv` rewrite
+- [x] `bf16_mac.sv` rewrite (latency=7: fp32_mul+fp32_add, tests pass)
+- [x] `bf16w_mac.sv` rewrite (latency=7: fp32_mul+fp32_add, tests pass)
+- [x] `bf16_matmul.sv` rewrite (latency=15: bf16_mac+fp32_add_tree, tests pass)
+- [ ] `bf16w_matmul.sv` / `fp32_matmul.sv` rewrite
 - [ ] `exp_lut.sv` rewrite
 - [ ] `gelu.sv` / `softmax.sv` / `layernorm.sv` rewrite
 - [ ] `adam_cell.sv` / `adam_core.sv` / `ce_grad.sv` rewrite
