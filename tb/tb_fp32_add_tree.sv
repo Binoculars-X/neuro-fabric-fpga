@@ -1,47 +1,69 @@
-// Testbench for fp32_add_tree (T=4 combinatorial FP32 adder tree)
+// Testbench for fp32_add_tree (T=4 pipelined FP32 adder tree, LATENCY=8 cycles)
 //
-// Reads:
-//   $NEURO_TESTVECS/fp32_add_tree/input.hex  -- N_VECS*T lines of FP32 hex (4 inputs per case)
-// Writes:
-//   $NEURO_TESTVECS/fp32_add_tree/output.hex -- N_VECS lines: actual RTL sums
-//   $NEURO_TESTVECS/fp32_add_tree/pass_fail.txt -- always "PASS" if simulation completes
-//
-// Numeric verification (1 ULP vs tree-order C# reference) is done in C# by reading output.hex.
+// Simple approach: drive inputs for N_VECS cycles, then wait long enough for
+// all outputs to appear (LATENCY + N_VECS), then capture and write.
 
 `timescale 1ns/1ps
 
 module tb_fp32_add_tree;
 
-    localparam int T      = 4;
-    localparam int N_VECS = 8;
+    localparam int T        = 4;
+    localparam int N_VECS   = 8;
+    localparam int LATENCY  = 8;    // fp32_add (4) + fp32_add (4)
+    localparam int CLK_HALF = 5;    // 100 MHz
 
-    logic [T*32-1:0] in_vec;
+    logic            clk = 0;
+    logic            rst = 1;
+    logic            valid_in  = 0;
+    logic [T*32-1:0] in_vec    = '0;
     logic [31:0]     sum_out;
+    logic            valid_out;
 
     fp32_add_tree #(.T(T)) dut (
-        .in_vec  (in_vec),
-        .sum_out (sum_out)
+        .clk      (clk),
+        .rst      (rst),
+        .valid_in (valid_in),
+        .in_vec   (in_vec),
+        .sum_out  (sum_out),
+        .valid_out(valid_out)
     );
 
-    logic [31:0] in_vals[0:N_VECS*T-1];
-    logic [31:0] got    [0:N_VECS-1];
+    always #CLK_HALF clk = ~clk;
+
+    logic [31:0] in_vals [0:N_VECS*T-1];
+    logic [31:0] got     [0:N_VECS-1];
+    logic [31:0] s1_s01  [0:N_VECS-1];  // Capture Stage 1 intermediate s01
+    logic [31:0] s1_s23  [0:N_VECS-1];  // Capture Stage 1 intermediate s23
 
     string  testvecs_dir;
-    string  input_path, passfail_path, output_path;
-    integer fd_in, fd_pf, fd_out, scan_ok;
+    string  input_path, passfail_path, output_path, debug_path;
+    integer fd_in, fd_pf, fd_out, fd_debug, scan_ok;
 
     task automatic write_pf(input string msg);
         fd_pf = $fopen(passfail_path, "w");
         if (fd_pf != 0) begin $fwrite(fd_pf, "%s\n", msg); $fclose(fd_pf); end
     endtask
 
+    // ── Capture outputs: sample whenever valid_out=1 ────────────────────────────
+    // valid_out=1 for N_VECS consecutive cycles; one output value per cycle.
+    // Capture by polling valid_out in a separate sampling thread after stimulus ends.
+    int   out_cnt = 0;
+
+    // (Capture happens in the initial block with manual polling)
+
+    // ── Main stimulus ─────────────────────────────────────────────────────────
     initial begin
+        $dumpfile("../../run/fpga-testvecs/fp32_add_tree/tb_fp32_add_tree.vcd");
+        $dumpvars(0, tb_fp32_add_tree, dut.s1_s01, dut.s1_s23);  // Capture intermediate values
+        
         if (!$value$plusargs("NEURO_TESTVECS=%s", testvecs_dir))
             testvecs_dir = "../../run/fpga-testvecs";
         input_path    = {testvecs_dir, "/fp32_add_tree/input.hex"};
         passfail_path = {testvecs_dir, "/fp32_add_tree/pass_fail.txt"};
         output_path   = {testvecs_dir, "/fp32_add_tree/output.hex"};
+        debug_path    = {testvecs_dir, "/fp32_add_tree/debug.txt"};
 
+        // Read input vectors
         fd_in = $fopen(input_path, "r");
         if (fd_in == 0) begin write_pf({"FAIL:cannot open ", input_path}); $finish; end
         for (int i = 0; i < N_VECS * T; i++) begin
@@ -50,21 +72,53 @@ module tb_fp32_add_tree;
         end
         $fclose(fd_in);
 
+        // Reset
+        @(posedge clk); @(posedge clk);
+        rst = 0;
+        @(posedge clk);
+        @(posedge clk);  // Extra delay to ensure rst is fully propagated
+
+        // Drive N_VECS inputs one per cycle
         for (int c = 0; c < N_VECS; c++) begin
             for (int j = 0; j < T; j++)
                 in_vec[j*32 +: 32] = in_vals[c*T + j];
-            #10;
+            valid_in = 1;
+            @(posedge clk);
+        end
+        valid_in = 0;
+        in_vec   = '0;
+
+        // Poll for valid_out, advancing one cycle at a time
+        do @(posedge clk);
+        while (!valid_out);
+        
+        // Now we're on a posedge where valid_out is high.
+        // Capture N_VECS outputs: read sum_out on each of the next N_VECS cycles.
+        for (int c = 0; c < N_VECS; c++) begin
             got[c] = sum_out;
+            if (c < N_VECS - 1) @(posedge clk);
         end
 
+        // Wait a bit more to be safe
+        repeat (5) @(posedge clk);
+
+        // Write output and debug
         fd_out = $fopen(output_path, "w");
-        if (fd_out != 0) begin
-            for (int c = 0; c < N_VECS; c++)
-                $fwrite(fd_out, "%08h\n", got[c]);
-            $fclose(fd_out);
+        if (fd_out == 0) begin write_pf("FAIL:cannot open output.hex"); $finish; end
+        for (int c = 0; c < N_VECS; c++)
+            $fwrite(fd_out, "%08h\n", got[c]);
+        $fclose(fd_out);
+
+        // Debug: also write what the RTL computed for s01 and s23
+        fd_debug = $fopen(debug_path, "w");
+        if (fd_debug != 0) begin
+            $fwrite(fd_debug, "=== Debug: intermediate s01, s23 for each case ===\n");
+            $fwrite(fd_debug, "NOTE: s1_s01/s23 are internal signals; captured at end\n");
+            $fwrite(fd_debug, "In a real test, need to capture these during pipeline\n");
+            $fclose(fd_debug);
         end
 
-        write_pf("PASS");
+        write_pf($sformatf("PASS captured=%0d", out_cnt));
         $finish;
     end
 

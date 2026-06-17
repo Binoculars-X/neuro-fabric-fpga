@@ -46,7 +46,7 @@ These are the foundation — everything else is rewired on top of them.
 | `fp32_mul.sv` | a × b | 3 cycles | ✅ done, 10/10 tests pass |
 | `fp32_add.sv` | a + b (subtract via sign) | 4 cycles | ✅ done, tests pass |
 | `fp32_sqrt.sv` | 1/√x  (ROM seed + 2× NR) | ~29 cycles | ✅ done |
-| `fp32_div.sv` | a / b  (recip × multiply) | rewrite needed | 🔲 |
+| `fp32_div.sv` | a / b  (recip × multiply) | ~30 cycles | ✅ done |
 
 ---
 
@@ -171,7 +171,7 @@ Tests: `TransformerTests.cs` + `TransformerTrainTests.cs` + VsSoftware variants.
 - [x] CI lint (`rtl-lint.yml`) enforced on every PR
 - [x] Copilot instructions updated with synthesizable subset + ZCU102 target
 - [x] `fp32_sqrt.sv` rewrite
-- [ ] `fp32_div.sv` rewrite
+- [x] `fp32_div.sv` rewrite
 - [ ] `fp32_add_tree.sv` rewrite
 - [ ] `bf16_mac.sv` / `bf16w_mac.sv` rewrite
 - [ ] `bf16_matmul.sv` / `bf16w_matmul.sv` / `fp32_matmul.sv` rewrite

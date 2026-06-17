@@ -33,8 +33,12 @@ module fp32_sqrt (
 );
 
     // -- 512-entry seed ROM --------------------------------------------------
-    logic [31:0] seed_rom [0:511];
-    initial $readmemh("recipsqrt_rom.hex", seed_rom);
+    // rom_style="block" forces RAMB36E2 inference (not LUT RAM).
+    // recipsqrt_rom.hex must be registered in Vivado sources:
+    //   add_files -fileset sources_1 recipsqrt_rom.mem
+    //   set_property file_type {Memory Initialization Files} [get_files recipsqrt_rom.mem]
+    (* rom_style = "block" *) logic [31:0] seed_rom [0:511];
+    initial $readmemh("recipsqrt_rom.mem", seed_rom);
 
     // -- fp32_mul instance ---------------------------------------------------
     logic        mul_valid_in;
