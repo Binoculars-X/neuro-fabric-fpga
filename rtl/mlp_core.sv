@@ -1,14 +1,26 @@
-// MLP feed-forward block forward pass (BF16 weights, FP32 activations)
+// MLP feed-forward block forward + backward pass (BF16 weights, FP32 activations)
 //
 // Algorithm (matches AttentionLayer.Forward() FF sub-block in C#):
 //   H1 = X  · Wff1     [T×D × D×FF → T×FF]   bf16w_matmul
 //   G  = GeLU(H1)       [T×FF]                 gelu (element-wise, serialised per row)
 //   Y  = G  · Wff2     [T×FF × FF×D → T×D]    bf16w_matmul
 //
+// Backward pass (matches AttentionLayer.Backward() FF sub-block in C#):
+//   dWff2 = Gᵀ · dY    [FF×T × T×D → FF×D]   fp32_matmul (A transposed)
+//   dG    = dY · Wff2ᵀ [T×D × D×FF → T×FF]   fp32_matmul (B transposed; FP32 weights decoded)
+//   dH1   = dG ⊙ GeLU'(H1)                    element-wise shortreal (no new primitives)
+//   dWff1 = Xᵀ · dH1   [D×T × T×FF → D×FF]   fp32_matmul (A transposed)
+//   dX    = dH1 · Wff1ᵀ [T×FF × FF×D → T×D]  fp32_matmul (B transposed; FP32 weights decoded)
+//
+// GeLU derivative (matches AttentionLayer.GeluBackward, c = 0.7978845608, c2 = 0.1070322244):
+//   d(GeLU)/dx = 0.5*(1+tanh(inner)) + 0.5*x*sech²(inner)*(c + c2*x²)
+//   where inner = c*(x + 0.044715*x³),  sech²(inner) = 1 - tanh²(inner)
+//   tanh is computed via shortreal exp: tanh(z) = (e^2z - 1)/(e^2z + 1)
+//
 // Parameters:
 //   T       — sequence length (default 4)
 //   D       — embedding dim (default 4)
-//   FF      — feed-forward hidden dim (default 16)
+//   FF      — feed-forward hidden dim (default 4)
 //   MAC_LAT — bf16w_matmul MAC pipeline depth (default 3)
 //   EXP_LAT — gelu exp_lut pipeline depth (default 4)
 //   LUT_SIZE — gelu exp LUT entries (default 256)
@@ -18,24 +30,22 @@
 //             Phase 2 will generalise with parameterised reg files.
 //
 // Interface:
-//   Weight load: wff1_wr_* [D×FF BF16], wff2_wr_* [FF×D BF16]
-//   Input load:  x_wr_*    [T×D FP32]
-//   start        — 1-cycle pulse to begin forward pass
-//   out_row      — [D*32-1:0] one output row per clock when out_valid is high
-//   out_valid    — T-cycle pulse (rows 0..T-1 in order)
-//   out_row_idx  — 0-based output row index
+//   Forward:   x_wr_*, wff1_wr_*, wff2_wr_*, start → out_row, out_valid, out_row_idx
+//   Backward:  bwd_start, dy_wr_* → dx_row, dx_valid, dx_row_idx, dWff1, dWff2 (flat)
 //
-// Sub-module instances (sequential reuse, Phase 1 prototype):
-//   u_bwm   — bf16w_matmul  (Wff1 pass; Wff2 pass)
-//   u_gelu  — gelu          (one element per clock, serialised over T×FF elements)
+// Sub-module instances:
+//   u_bwm   — bf16w_matmul  (Wff1/Wff2 forward passes)
+//   u_fpm   — fp32_matmul   (all 5 backward gradient matmuls; M=K=N=4 always)
+//   u_gelu  — gelu          (forward GeLU)
 //
-// FSM states:
-//   IDLE → LD_W1 → RUN_W1 → WAIT_W1 → GELU_FEED → GELU_COLLECT →
-//   LD_W2 → RUN_W2 → WAIT_W2 → OUTPUT → IDLE
-//
-// Latency (T=4, D=4, FF=4, MAC_LAT=3, EXP_LAT=4):
-//   Wff1 matmul: ~38 cycles; GeLU T×FF elements: T*FF + EXP_LAT+2 cycles;
-//   Wff2 matmul: ~38 cycles. Total ~120 cycles.
+// FSM forward states:
+//   IDLE → LD_W1 → RUN_W1 → WAIT_W1 → GELU_FEED → GELU_COLLECT → LD_W2 → RUN_W2 → WAIT_W2 → IDLE
+// FSM backward states (entered on bwd_start after forward completes):
+//   BWD_LD_DW2 → BWD_RUN_DW2 → BWD_WAIT_DW2 →
+//   BWD_LD_DG  → BWD_RUN_DG  → BWD_WAIT_DG  →
+//   BWD_GELU_GRAD →
+//   BWD_LD_DW1 → BWD_RUN_DW1 → BWD_WAIT_DW1 →
+//   BWD_LD_DX  → BWD_RUN_DX  → BWD_WAIT_DX  → IDLE
 
 `timescale 1ns/1ps
 
@@ -71,7 +81,24 @@ module mlp_core #(
 
     output logic [D*32-1:0]      out_row,
     output logic                  out_valid,
-    output logic [$clog2(T)-1:0] out_row_idx
+    output logic [$clog2(T)-1:0] out_row_idx,
+
+    // ── Backward pass ────────────────────────────────────────────────────
+    // Load dY [T×D] FP32 row-major (upstream gradient from next layer/loss)
+    input  logic        dy_wr_en,
+    input  logic [7:0]  dy_wr_addr,
+    input  logic [31:0] dy_wr_data,
+
+    input  logic bwd_start,    // 1-cycle pulse: begin backward pass
+
+    // dX output — T rows streamed row-by-row (same protocol as out_row)
+    output logic [D*32-1:0]      dx_row,
+    output logic                  dx_valid,
+    output logic [$clog2(T)-1:0] dx_row_idx,
+
+    // Gradient accumulator outputs (flat, whole matrix, valid one cycle after dx_valid T-th row)
+    output logic [D*FF*32-1:0]  dWff1_flat,   // [D×FF] FP32 row-major
+    output logic [FF*D*32-1:0]  dWff2_flat    // [FF×D] FP32 row-major
 );
 
     // -----------------------------------------------------------------------
@@ -101,6 +128,29 @@ module mlp_core #(
     // -----------------------------------------------------------------------
     logic [31:0] H1_reg [0:T-1][0:FF-1];   // pre-GeLU
     logic [31:0] G_reg  [0:T-1][0:FF-1];   // post-GeLU
+
+    // -----------------------------------------------------------------------
+    // Backward registers
+    // -----------------------------------------------------------------------
+    logic [31:0] dY_reg   [0:T-1][0:D-1];   // upstream gradient
+    logic [31:0] dG_reg   [0:T-1][0:FF-1];  // gradient after Wff2ᵀ
+    logic [31:0] dH1_reg  [0:T-1][0:FF-1];  // gradient after GeLU backward
+    logic [31:0] dWff1_reg[0:D-1][0:FF-1];  // weight gradient for Wff1
+    logic [31:0] dWff2_reg[0:FF-1][0:D-1];  // weight gradient for Wff2
+
+    always_ff @(posedge clk)
+        if (dy_wr_en)
+            dY_reg[dy_wr_addr / D][dy_wr_addr % D] <= dy_wr_data;
+
+    // Pack gradient registers to flat outputs (combinational)
+    always_comb begin
+        for (int i = 0; i < D; i++)
+            for (int j = 0; j < FF; j++)
+                dWff1_flat[(i*FF+j)*32 +: 32] = dWff1_reg[i][j];
+        for (int i = 0; i < FF; i++)
+            for (int j = 0; j < D; j++)
+                dWff2_flat[(i*D+j)*32 +: 32] = dWff2_reg[i][j];
+    end
 
     // -----------------------------------------------------------------------
     // bf16w_matmul instance — shared for Wff1 and Wff2 passes
@@ -144,6 +194,67 @@ module mlp_core #(
     );
 
     // -----------------------------------------------------------------------
+    // fp32_matmul instance — used for all 5 backward gradient matmuls
+    // Instantiated with M=T, K=T, N=FF (4×4×4 covers all backward shapes)
+    // For each backward matmul the load loops treat A/B as the right shapes.
+    // -----------------------------------------------------------------------
+    logic        fpm_a_wr_en;
+    logic [7:0]  fpm_a_wr_addr;
+    logic [31:0] fpm_a_wr_data;
+    logic        fpm_b_wr_en;
+    logic [7:0]  fpm_b_wr_addr;
+    logic [31:0] fpm_b_wr_data;
+    logic        fpm_start;
+    logic [FF*32-1:0] fpm_c_row;   // FF==D in prototype
+    logic        fpm_c_valid;
+    logic [1:0]  fpm_c_row_idx;
+
+    fp32_matmul #(
+        .M(T),
+        .K(T),
+        .N(FF)
+    ) u_fpm (
+        .clk       (clk),
+        .rst       (rst),
+        .en        (en),
+        .a_wr_en   (fpm_a_wr_en),
+        .a_wr_addr (fpm_a_wr_addr),
+        .a_wr_data (fpm_a_wr_data),
+        .b_wr_en   (fpm_b_wr_en),
+        .b_wr_addr (fpm_b_wr_addr),
+        .b_wr_data (fpm_b_wr_data),
+        .start     (fpm_start),
+        .c_row     (fpm_c_row),
+        .c_valid   (fpm_c_valid),
+        .c_row_idx (fpm_c_row_idx)
+    );
+
+    // -----------------------------------------------------------------------
+    // exp_lut instance for backward GeLU - T*FF elements serialized 1/cycle
+    // Computes exp(2*inner) needed for tanh in GeLU'(H1).
+    // -----------------------------------------------------------------------
+    logic [31:0] bwd_exp_x_reg;
+    logic        bwd_exp_valid_in;
+    logic [31:0] bwd_exp_result;
+    logic        bwd_exp_valid_out;
+
+    exp_lut #(.LUT_SIZE(LUT_SIZE), .LUT_FILE(LUT_FILE)) u_bwd_exp (
+        .clk         (clk),
+        .rst         (rst),
+        .en          (1'b1),
+        .x_fp32      (bwd_exp_x_reg),
+        .valid_in    (bwd_exp_valid_in),
+        .result_fp32 (bwd_exp_result),
+        .valid_out   (bwd_exp_valid_out)
+    );
+
+    // Buffers for backward GeLU serialization (T*FF = 16 elements)
+    logic [31:0] bwd_inner_buf [0:T*FF-1];  // 2*inner per element (FP32 bits)
+    logic [31:0] bwd_e2_buf    [0:T*FF-1];  // exp(2*inner) per element
+    logic [5:0]  bwd_feed_cnt;              // feed index 0..T*FF-1
+    logic [5:0]  bwd_coll_idx;              // collection index 0..T*FF-1
+
+    // -----------------------------------------------------------------------
     // gelu instance — T*FF elements processed one per clock
     // -----------------------------------------------------------------------
     logic        gelu_valid_in;
@@ -168,7 +279,7 @@ module mlp_core #(
     // -----------------------------------------------------------------------
     // FSM
     // -----------------------------------------------------------------------
-    typedef enum logic [3:0] {
+    typedef enum logic [4:0] {
         IDLE,
         LD_W1,       // load X into bwm A, Wff1 into bwm B
         RUN_W1,      // pulse bwm_start
@@ -179,7 +290,20 @@ module mlp_core #(
         RUN_W2,      // pulse bwm_start
         WAIT_W2,     // collect T rows of Y → output
         OUTPUT,      // emit T output rows
-        DONE
+        DONE,
+        // ── Backward states ───────────────────────────────────────────────
+        // dWff2 = Gᵀ · dY  [FF×T × T×D → FF×D]  (A=Gᵀ, B=dY, K=T, M=FF, N=D)
+        BWD_LD_DW2,  BWD_RUN_DW2,  BWD_WAIT_DW2,
+        // dG   = dY · Wff2ᵀ [T×D × D×FF → T×FF]  (A=dY, B=Wff2ᵀ decoded to FP32, K=D, M=T, N=FF)
+        BWD_LD_DG,   BWD_RUN_DG,   BWD_WAIT_DG,
+        // dH1  = dG * GeLU'(H1) element-wise: feed -> drain -> apply
+        BWD_GELU_FEED,   // feed T*FF 2*inner values to bwd exp_lut
+        BWD_GELU_DRAIN,  // drain last EXP_LAT pipeline results
+        BWD_GELU_APPLY,  // compute dH1 from buffered exp results
+        // dWff1 = Xᵀ · dH1  [D×T × T×FF → D×FF]  (A=Xᵀ, B=dH1, K=T, M=D, N=FF)
+        BWD_LD_DW1,  BWD_RUN_DW1,  BWD_WAIT_DW1,
+        // dX   = dH1 · Wff1ᵀ [T×FF × FF×D → T×D]  (A=dH1, B=Wff1ᵀ decoded, K=FF, M=T, N=D)
+        BWD_LD_DX,   BWD_RUN_DX,   BWD_WAIT_DX
     } state_t;
 
     state_t state;
@@ -202,15 +326,27 @@ module mlp_core #(
             bwm_a_wr_en  <= 0;
             bwm_b_wr_en  <= 0;
             bwm_start    <= 0;
-            gelu_valid_in <= 0;
+            gelu_valid_in    <= 0;
+            bwd_exp_valid_in <= 0;
+            bwd_feed_cnt     <= '0;
+            bwd_coll_idx     <= '0;
             out_valid    <= 0;
+            fpm_a_wr_en  <= 0;
+            fpm_b_wr_en  <= 0;
+            fpm_start    <= 0;
+            dx_valid     <= 0;
         end else if (en) begin
             // Defaults
-            bwm_a_wr_en  <= 0;
-            bwm_b_wr_en  <= 0;
-            bwm_start    <= 0;
-            gelu_valid_in <= 0;
-            out_valid    <= 0;
+            bwm_a_wr_en      <= 0;
+            bwm_b_wr_en      <= 0;
+            bwm_start        <= 0;
+            gelu_valid_in    <= 0;
+            bwd_exp_valid_in <= 0;
+            out_valid        <= 0;
+            fpm_a_wr_en      <= 0;
+            fpm_b_wr_en      <= 0;
+            fpm_start        <= 0;
+            dx_valid         <= 0;
 
             case (state)
 
@@ -219,6 +355,9 @@ module mlp_core #(
                     if (start) begin
                         load_idx <= 0;
                         state    <= LD_W1;
+                    end else if (bwd_start) begin
+                        load_idx <= 0;
+                        state    <= BWD_LD_DW2;
                     end
                 end
 
@@ -320,8 +459,257 @@ module mlp_core #(
                     end
                 end
 
+                // ══════════════════════════════════════════════════════════
+                // BACKWARD STATES
+                // ══════════════════════════════════════════════════════════
+                // All backward matmuls use u_fpm (fp32_matmul, M=T K=T N=FF).
+                // For non-square shapes we only write the needed sub-region.
+                //
+                // Notation for u_fpm A/B addressing:
+                //   A is M×K stored row-major, addr = row*K + col
+                //   B is K×N stored row-major, addr = row*N + col
+                //   C output is M×N rows streamed via c_valid/c_row/c_row_idx
+                //
+                // ── BWD_LD_DW2: dWff2 = Gᵀ · dY  (M=FF, K=T, N=D) ──────
+                //   A = Gᵀ [FF×T] row-major, addr i*T+k → G_reg[k][i]
+                //   B = dY  [T×D]  row-major, addr k*D+j → dY_reg[k][j]
+                //   FF*T == T*D == 16 in prototype (all 4)
+                BWD_LD_DW2: begin
+                    if (load_idx < FF * T) begin
+                        automatic int i_aw2 = load_idx / T;
+                        automatic int k_aw2 = load_idx % T;
+                        automatic int k_bw2 = load_idx / D;
+                        automatic int j_bw2 = load_idx % D;
+                        fpm_a_wr_en   <= 1;
+                        fpm_a_wr_addr <= load_idx[7:0];
+                        fpm_a_wr_data <= G_reg[k_aw2][i_aw2];  // Gᵀ[i][k] = G[k][i]
+                        fpm_b_wr_en   <= 1;
+                        fpm_b_wr_addr <= load_idx[7:0];
+                        fpm_b_wr_data <= dY_reg[k_bw2][j_bw2];
+                        load_idx <= load_idx + 1;
+                    end else begin
+                        state <= BWD_RUN_DW2;
+                    end
+                end
+
+                BWD_RUN_DW2: begin
+                    fpm_start <= 1;
+                    out_cnt   <= 0;
+                    state     <= BWD_WAIT_DW2;
+                end
+
+                BWD_WAIT_DW2: begin
+                    if (fpm_c_valid) begin
+                        // dWff2[fpm_c_row_idx][j] for j in 0..D-1
+                        for (int j = 0; j < D; j++)
+                            dWff2_reg[fpm_c_row_idx][j] <= fpm_c_row[j*32 +: 32];
+                        out_cnt <= out_cnt + 1;
+                        if (out_cnt == FF - 1) begin
+                            load_idx <= 0;
+                            state    <= BWD_LD_DG;
+                        end
+                    end
+                end
+
+                // ── BWD_LD_DG: dG = dY · Wff2ᵀ  (M=T, K=D, N=FF) ───────
+                //   A = dY    [T×D]:  addr i*D+k   → dY_reg[i][k]
+                //   B = Wff2ᵀ [D×FF]: addr k*FF+j  → Wff2_reg[j][k] decoded BF16→FP32
+                //   T*D == D*FF == 16 in prototype (all 4)
+                BWD_LD_DG: begin
+                    if (load_idx < T * D) begin
+                        automatic int          i_dg     = load_idx / D;
+                        automatic int          k_dg     = load_idx % D;
+                        automatic int          b_addr_dg = k_dg * FF + i_dg;
+                        automatic logic [15:0] bf16_dg  = Wff2_reg[i_dg][k_dg]; // Wff2ᵀ[k][j]=Wff2[j][k]
+                        fpm_a_wr_en   <= 1;
+                        fpm_a_wr_addr <= load_idx[7:0];
+                        fpm_a_wr_data <= dY_reg[i_dg][k_dg];
+                        fpm_b_wr_en   <= 1;
+                        fpm_b_wr_addr <= b_addr_dg[7:0];
+                        fpm_b_wr_data <= {bf16_dg, 16'h0000};  // BF16→FP32
+                        load_idx <= load_idx + 1;
+                    end else begin
+                        state <= BWD_RUN_DG;
+                    end
+                end
+
+                BWD_RUN_DG: begin
+                    fpm_start <= 1;
+                    out_cnt   <= 0;
+                    state     <= BWD_WAIT_DG;
+                end
+
+                BWD_WAIT_DG: begin
+                    if (fpm_c_valid) begin
+                        for (int j = 0; j < FF; j++)
+                            dG_reg[fpm_c_row_idx][j] <= fpm_c_row[j*32 +: 32];
+                        out_cnt <= out_cnt + 1;
+                        if (out_cnt == T - 1) begin
+                            bwd_feed_cnt <= '0;
+                            bwd_coll_idx <= '0;
+                            state        <= BWD_GELU_FEED;
+                        end
+                    end
+                end
+
+                // ── BWD_GELU_FEED: compute inner per element, feed exp(2*inner) ──
+                // c = 0.7978845608, c2 = 0.1070322244
+                // inner = c*(x + 0.044715*x^3)  - shortreal only
+                // feed 2*inner to bwd exp_lut; also buffer 2*inner for APPLY
+                BWD_GELU_FEED: begin
+                    begin
+                        automatic int       ti_f    = bwd_feed_cnt / FF;
+                        automatic int       fi_f    = bwd_feed_cnt % FF;
+                        automatic shortreal x_sr_f  = $bitstoshortreal(H1_reg[ti_f][fi_f]);
+                        automatic shortreal x2_f    = x_sr_f * x_sr_f;
+                        automatic shortreal inner_f  = 0.7978845608 * (x_sr_f + 0.044715 * x_sr_f * x2_f);
+                        automatic shortreal two_inner = 2.0 * inner_f;
+                        bwd_exp_x_reg        <= $shortrealtobits(two_inner);
+                        bwd_exp_valid_in     <= 1'b1;
+                        bwd_inner_buf[bwd_feed_cnt] <= $shortrealtobits(two_inner);
+                    end
+                    if (bwd_feed_cnt == 6'(T*FF-1)) begin
+                        bwd_feed_cnt <= '0;
+                        // do NOT override valid_in here - last element must be fed
+                        state        <= BWD_GELU_DRAIN;
+                        load_idx     <= 0;
+                    end else bwd_feed_cnt <= bwd_feed_cnt + 1;
+                end
+
+                // -- BWD_GELU_DRAIN: drain last EXP_LAT+1 pipeline results ---
+                // +1 because last element is registered by exp_lut at start of DRAIN
+                BWD_GELU_DRAIN: begin
+                    if (load_idx == EXP_LAT) begin
+                        load_idx     <= 0;
+                        bwd_coll_idx <= '0;
+                        state        <= BWD_GELU_APPLY;
+                    end else load_idx <= load_idx + 1;
+                end
+
+                // -- BWD_GELU_APPLY: compute dH1 from buffered exp results -
+                // Uses bwd_e2_buf[T*FF] (filled by collection block below).
+                // All T*FF elements computed in one cycle (shortreal only).
+                BWD_GELU_APPLY: begin
+                    for (int ti = 0; ti < T; ti++) begin
+                        for (int fi = 0; fi < FF; fi++) begin
+                            automatic int       idx_a   = ti * FF + fi;
+                            automatic shortreal x_sr_a  = $bitstoshortreal(H1_reg[ti][fi]);
+                            automatic shortreal dg_sr_a = $bitstoshortreal(dG_reg[ti][fi]);
+                            automatic shortreal e2_a    = $bitstoshortreal(bwd_e2_buf[idx_a]);
+                            automatic shortreal tanh_a  = (e2_a - 1.0) / (e2_a + 1.0);
+                            automatic shortreal sech2_a = 1.0 - tanh_a * tanh_a;
+                            automatic shortreal x2_a    = x_sr_a * x_sr_a;
+                            automatic shortreal dgelu_a = 0.5 * (1.0 + tanh_a)
+                                + 0.5 * x_sr_a * sech2_a * (0.7978845608 + 0.1070322244 * x2_a);
+                            dH1_reg[ti][fi] <= $shortrealtobits(dg_sr_a * dgelu_a);
+                        end
+                    end
+                    load_idx <= 0;
+                    state    <= BWD_LD_DW1;
+                end
+
+                // -- BWD_LD_DW1: dWff1 = XT * dH1  (M=D, K=T, N=FF) -----
+                //   A = XT  [D*T]: addr i*T+k -> X_reg[k][i]
+                //   B = dH1 [T*FF]: addr k*FF+j -> dH1_reg[k][j]
+                //   D*T == T*FF == 16 in prototype; loop addr=i_w1*T+k_w1; B addr=k_w1*FF+i_w1
+                BWD_LD_DW1: begin
+                    if (load_idx < D * T) begin
+                        automatic int i_w1     = load_idx / T;
+                        automatic int k_w1     = load_idx % T;
+                        automatic int b_addr_w1 = k_w1 * FF + i_w1;
+                        fpm_a_wr_en   <= 1;
+                        fpm_a_wr_addr <= load_idx[7:0];
+                        fpm_a_wr_data <= X_reg[k_w1][i_w1];    // XT[i][k] = X[k][i]
+                        fpm_b_wr_en   <= 1;
+                        fpm_b_wr_addr <= b_addr_w1[7:0];
+                        fpm_b_wr_data <= dH1_reg[k_w1][i_w1];  // dH1[k][j], j==i_w1 (D==FF)
+                        load_idx <= load_idx + 1;
+                    end else begin
+                        state <= BWD_RUN_DW1;
+                    end
+                end
+
+                BWD_RUN_DW1: begin
+                    fpm_start <= 1;
+                    out_cnt   <= 0;
+                    state     <= BWD_WAIT_DW1;
+                end
+
+                BWD_WAIT_DW1: begin
+                    if (fpm_c_valid) begin
+                        for (int j = 0; j < FF; j++)
+                            dWff1_reg[fpm_c_row_idx][j] <= fpm_c_row[j*32 +: 32];
+                        out_cnt <= out_cnt + 1;
+                        if (out_cnt == D - 1) begin
+                            load_idx <= 0;
+                            state    <= BWD_LD_DX;
+                        end
+                    end
+                end
+
+                // ── BWD_LD_DX: dX = dH1 · Wff1ᵀ  (M=T, K=FF, N=D) ──────
+                //   A = dH1  [T×FF]:  addr i*FF+k  → dH1_reg[i][k]
+                //   B = Wff1ᵀ[FF×D]: addr k*D+j   → Wff1_reg[j][k] decoded BF16→FP32
+                //   T*FF == FF*D == 16 in prototype (all 4); j=i_dx, k=k_dx (D==FF)
+                BWD_LD_DX: begin
+                    if (load_idx < T * FF) begin
+                        automatic int          i_dx      = load_idx / FF;
+                        automatic int          k_dx      = load_idx % FF;
+                        automatic int          b_addr_dx = k_dx * D + i_dx;
+                        automatic logic [15:0] bf16_dx   = Wff1_reg[i_dx][k_dx]; // Wff1ᵀ[k][j]=Wff1[j][k]
+                        fpm_a_wr_en   <= 1;
+                        fpm_a_wr_addr <= load_idx[7:0];
+                        fpm_a_wr_data <= dH1_reg[i_dx][k_dx];
+                        fpm_b_wr_en   <= 1;
+                        fpm_b_wr_addr <= b_addr_dx[7:0];
+                        fpm_b_wr_data <= {bf16_dx, 16'h0000};  // BF16→FP32
+                        load_idx <= load_idx + 1;
+                    end else begin
+                        state <= BWD_RUN_DX;
+                    end
+                end
+
+                BWD_RUN_DX: begin
+                    fpm_start <= 1;
+                    out_cnt   <= 0;
+                    state     <= BWD_WAIT_DX;
+                end
+
+                BWD_WAIT_DX: begin
+                    if (fpm_c_valid) begin
+                        dx_row     <= fpm_c_row[D*32-1:0];
+                        dx_row_idx <= fpm_c_row_idx[$clog2(T)-1:0];
+                        dx_valid   <= 1;
+                        out_cnt    <= out_cnt + 1;
+                        if (out_cnt == T - 1)
+                            state <= IDLE;
+                    end
+                end
+
                 default: state <= IDLE;
             endcase
+        end
+    end
+
+    // -----------------------------------------------------------------------
+    // Collect bwd exp_lut results whenever valid_out fires
+    // -----------------------------------------------------------------------
+    // Separate counter for bwd exp_lut collection (avoids multiple-driver conflict).
+    // Reset when BWD_GELU_FEED begins (bwd_feed_cnt goes to 0 in main FSM).
+    logic [5:0] bwd_e2_coll;
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            bwd_e2_coll <= '0;
+        end else begin
+            // Reset when feed phase starts (detected by bwd_feed_cnt resetting to 0
+            // while in BWD_WAIT_DG->BWD_GELU_FEED transition — use state signal).
+            if (state == BWD_WAIT_DG && fpm_c_valid && out_cnt == T - 1)
+                bwd_e2_coll <= '0;
+            else if (bwd_exp_valid_out && bwd_e2_coll < 6'(T*FF)) begin
+                bwd_e2_buf[bwd_e2_coll[3:0]] <= bwd_exp_result;
+                bwd_e2_coll                   <= bwd_e2_coll + 1;
+            end
         end
     end
 

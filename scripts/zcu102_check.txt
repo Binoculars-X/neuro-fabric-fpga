@@ -1,0 +1,5 @@
+=== BOARDS WITH ZCU102 ===
+xilinx.com:zcu102:3.3
+xilinx.com:zcu102:3.4
+
+=== ALL BOARDS WITH ZU9 ===

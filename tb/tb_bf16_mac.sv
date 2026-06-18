@@ -16,7 +16,7 @@ module tb_bf16_mac;
     // ------------------------------------------------------------------
     // Parameters
     // ------------------------------------------------------------------
-    localparam int LATENCY    = 3;
+    localparam int LATENCY    = 7;   // fp32_mul(3) + fp32_add(4)
     localparam int N_VECTORS  = 16;   // C# writes exactly this many per run
 
     // ------------------------------------------------------------------

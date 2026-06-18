@@ -12,8 +12,8 @@
 // (was 16 ULP when reference used C# float32 arithmetic directly)
 // shortreal to double internally; same algorithm as C# reference).
 //
-// Parameters match bf16_matmul defaults: M=4, K=4, N=4, MAC_LATENCY=3, ADD_STAGES=2.
-// TOTAL_LAT = 5 cycles from start to first valid output row.
+// Parameters match bf16_matmul defaults: M=4, K=4, N=4, MAC_LATENCY=7, ADD_TREE_LAT=8.
+// TOTAL_LAT = 15 cycles from start to first valid output row.
 
 `timescale 1ns/1ps
 
@@ -22,9 +22,9 @@ module tb_bf16_matmul;
     localparam int M           = 4;
     localparam int K           = 4;
     localparam int N           = 4;
-    localparam int MAC_LATENCY = 3;
-    localparam int ADD_STAGES  = 2;
-    localparam int TOTAL_LAT   = MAC_LATENCY + ADD_STAGES;
+    localparam int MAC_LATENCY  = 7;
+    localparam int ADD_TREE_LAT = 8;
+    localparam int TOTAL_LAT    = MAC_LATENCY + ADD_TREE_LAT;
 
     // ------------------------------------------------------------------
     // DUT signals
@@ -47,7 +47,7 @@ module tb_bf16_matmul;
     logic            c_valid;
     logic [1:0]      c_row_idx;
 
-    bf16_matmul #(.M(M), .K(K), .N(N), .MAC_LATENCY(MAC_LATENCY)) dut (
+    bf16_matmul #(.M(M), .K(K), .N(N), .MAC_LATENCY(MAC_LATENCY), .ADD_TREE_LAT(ADD_TREE_LAT)) dut (
         .clk        (clk),
         .rst        (rst),
         .en         (en),

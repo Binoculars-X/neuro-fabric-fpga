@@ -1,0 +1,62 @@
+name: RTL Lint — No Simulation-Only Constructs
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'rtl/**'
+      - 'tb/**'
+      - '.github/workflows/rtl-lint.yml'
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  ban-nonsynthesizable:
+    name: Reject shortreal / real / $bitstoshortreal / $shortrealtobits
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan RTL for banned simulation-only constructs
+        run: |
+          echo "Scanning rtl/ for non-synthesizable FP constructs..."
+          BANNED_PATTERN='shortreal|(\$bitstoshortreal|\$shortrealtobits|\$bitstoreal|\$realtobits)[[:space:]]*\('
+          HITS=$(grep -rn -E "$BANNED_PATTERN" rtl/ || true)
+          if [ -n "$HITS" ]; then
+            echo ""
+            echo "ERROR: Non-synthesizable constructs found in RTL:"
+            echo "----------------------------------------------------"
+            echo "$HITS"
+            echo "----------------------------------------------------"
+            echo ""
+            echo "BANNED in rtl/:"
+            echo "  shortreal"
+            echo "  real"
+            echo "  \$bitstoshortreal(...)"
+            echo "  \$shortrealtobits(...)"
+            echo "  \$bitstoreal(...)"
+            echo "  \$realtobits(...)"
+            echo ""
+            echo "REQUIRED instead:"
+            echo "  wire [31:0] fp32_bits"
+            echo "  Xilinx Floating-Point IP instantiation"
+            echo "  Explicit clk/rst/valid_in/valid_out/latency ports"
+            echo "  Latency-aware FSM with valid/ready handshake"
+            echo ""
+            echo "See: docs/rtl-synthesizable-rules.md"
+            exit 1
+          fi
+          echo "OK — no banned constructs found in rtl/"
+
+      - name: Warn if simulation files use banned constructs (non-blocking)
+        run: |
+          BANNED_PATTERN='shortreal|(\$bitstoshortreal|\$shortrealtobits|\$bitstoreal|\$realtobits)[[:space:]]*\('
+          HITS=$(grep -rn -E "$BANNED_PATTERN" tb/ sim/ 2>/dev/null || true)
+          if [ -n "$HITS" ]; then
+            echo "WARNING: Simulation-only constructs in tb/ or sim/ (not blocking, but prefer synthesizable):"
+            echo "$HITS"
+          else
+            echo "OK — tb/ and sim/ are clean too."
+          fi

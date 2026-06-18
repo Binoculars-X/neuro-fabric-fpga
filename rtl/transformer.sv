@@ -168,10 +168,15 @@ module transformer #(
     // -----------------------------------------------------------------------
     // Sub-module instances
     // -----------------------------------------------------------------------
-    layernorm #(.D(D)) u_ln (
+    layernorm #(.D(D), .T(T)) u_ln (
         .clk(clk), .rst(rst), .en(en),
         .x_in(ln_x_in), .gamma(ln_gamma), .beta(ln_beta),
-        .start(ln_start), .y_out(ln_y_out), .out_valid(ln_out_valid)
+        .start(ln_start), .y_out(ln_y_out), .out_valid(ln_out_valid),
+        // Backward ports — not yet wired (7b-iv)
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dGamma_flat(), .dBeta_flat()
     );
 
     attention_core #(
@@ -185,7 +190,12 @@ module transformer #(
         .wv_wr_en(att_wv_wr_en), .wv_wr_addr(att_wv_wr_addr), .wv_wr_data(att_wv_wr_data),
         .wo_wr_en(att_wo_wr_en), .wo_wr_addr(att_wo_wr_addr), .wo_wr_data(att_wo_wr_data),
         .start(att_start),
-        .out_row(att_out_row), .out_valid(att_out_valid), .out_row_idx(att_out_row_idx)
+        .out_row(att_out_row), .out_valid(att_out_valid), .out_row_idx(att_out_row_idx),
+        // Backward ports — not yet wired (7b-iv)
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dWq_flat(), .dWk_flat(), .dWv_flat(), .dWo_flat()
     );
 
     mlp_core #(
@@ -197,7 +207,12 @@ module transformer #(
         .wff1_wr_en(mlp_wff1_wr_en), .wff1_wr_addr(mlp_wff1_wr_addr), .wff1_wr_data(mlp_wff1_wr_data),
         .wff2_wr_en(mlp_wff2_wr_en), .wff2_wr_addr(mlp_wff2_wr_addr), .wff2_wr_data(mlp_wff2_wr_data),
         .start(mlp_start),
-        .out_row(mlp_out_row), .out_valid(mlp_out_valid), .out_row_idx(mlp_out_row_idx)
+        .out_row(mlp_out_row), .out_valid(mlp_out_valid), .out_row_idx(mlp_out_row_idx),
+        // Backward ports — not yet wired (7b-iv will connect)
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dWff1_flat(), .dWff2_flat()
     );
 
     fp32_matmul #(.M(T), .K(D), .N(V), .MUL_LATENCY(MUL_LAT)) u_proj (

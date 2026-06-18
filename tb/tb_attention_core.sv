@@ -65,7 +65,12 @@ module tb_attention_core;
         .start      (start),
         .out_row    (out_row),
         .out_valid  (out_valid),
-        .out_row_idx(out_row_idx)
+        .out_row_idx(out_row_idx),
+        // Backward ports — not used in forward-only testbench
+        .dy_wr_en(1'b0), .dy_wr_addr(8'h0), .dy_wr_data(32'h0),
+        .bwd_start(1'b0),
+        .dx_row(), .dx_valid(), .dx_row_idx(),
+        .dWq_flat(), .dWk_flat(), .dWv_flat(), .dWo_flat()
     );
 
     always #5 clk = ~clk;

@@ -2,6 +2,8 @@
 
 Xilinx FPGA RTL implementation of the NeuronFabric Transformer training pipeline.
 
+**Paper:** [NeuronFabric — arXiv:2606.16440](https://arxiv.org/abs/2606.16440)
+
 ## Folder structure
 
 ```

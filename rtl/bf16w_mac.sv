@@ -1,30 +1,39 @@
-// FP32×BF16 Multiply-Accumulate (MAC) Unit — bf16w training path
+// bf16w_mac.sv — Synthesizable FP32×BF16 Multiply-Accumulate Unit (bf16w training path)
 //
 // Matches AdamBF16WeightsAttentionCore forward pass:
-//   activations: always FP32 (never quantized)
+//   activations: FP32 (a_fp32, never quantized)
 //   weights:     stored BF16, decoded on-the-fly to FP32 before multiply
 //
-// Operation (LATENCY=3 pipeline stages):
-//   Stage 1: latch a_fp32, decode b_bf16 → fp32; latch c_fp32
-//   Stage 2: multiply a_fp32 * b_fp32 (FP32×FP32 after decode)
-//   Stage 3: accumulate product + c_fp32
+// Architecture:
+//   Decode b_bf16 → b_fp32 (combinatorial, zero-extend lower 16 bits)
+//   fp32_mul: a_fp32 * b_fp32 → product  (3-cycle latency)
+//   Delay pipe: c_fp32 aligned to product output (3 cycles)
+//   fp32_add: product + c_fp32_delayed → result  (4-cycle latency)
+//
+// LATENCY = 7 cycles (3 mul + 4 add).
 //
 // Ports:
-//   a_fp32   — 32-bit FP32 activation input
-//   b_bf16   — 16-bit BF16 weight input (decoded to FP32 in stage 1)
-//   c_fp32   — 32-bit FP32 accumulator input (chain or zero)
-//   valid_in — qualify input
-//   result_fp32 — 32-bit FP32 accumulated result (LATENCY cycles later)
+//   clk         — clock
+//   rst         — synchronous active-high reset
+//   en          — retained for interface compatibility (unused internally)
+//   a_fp32      — 32-bit FP32 activation input
+//   b_bf16      — 16-bit BF16 weight input
+//   c_fp32      — 32-bit FP32 accumulator input (chain or zero)
+//   valid_in    — qualify input
+//   result_fp32 — 32-bit FP32 result (7 cycles after valid_in)
 //   valid_out   — qualifies output
+//
+// Vivado-synthesizable: logic [N:0] only, no float types or simulation tasks.
+// Target: Xilinx ZCU102 (UltraScale+ XCZU9EG), Vivado 2023.x.
 
 `timescale 1ns/1ps
 
 module bf16w_mac #(
-    parameter int LATENCY = 3
+    parameter int LATENCY = 7   // fixed by submodule structure; parameter kept for interface compat
 )(
     input  logic        clk,
     input  logic        rst,
-    input  logic        en,
+    input  logic        en,         // retained for interface compat; unused internally
 
     input  logic [31:0] a_fp32,    // FP32 activation
     input  logic [15:0] b_bf16,    // BF16 weight
@@ -36,55 +45,56 @@ module bf16w_mac #(
 );
 
     // -----------------------------------------------------------------------
-    // Decode: BF16 weight → FP32 = zero-extend lower 16 bits
+    // Decode: BF16 weight → FP32 = zero-extend lower 16 bits (combinatorial)
     // -----------------------------------------------------------------------
     logic [31:0] b_fp32;
     always_comb b_fp32 = {b_bf16, 16'h0000};
 
     // -----------------------------------------------------------------------
-    // Pipeline registers
+    // Stage 1: fp32_mul — a_fp32 * b_fp32, latency = 3 cycles
     // -----------------------------------------------------------------------
-    logic [31:0] s1_a, s1_b, s1_c;
-    logic        s1_v;
+    logic [31:0] mul_result;
+    logic        mul_valid;
 
-    logic [31:0] s2_prod, s2_c;
-    logic        s2_v;
+    fp32_mul u_mul (
+        .clk      (clk),
+        .rst      (rst),
+        .valid_in (valid_in),
+        .a        (a_fp32),
+        .b        (b_fp32),
+        .result   (mul_result),
+        .valid_out(mul_valid)
+    );
 
-    logic [31:0] s3_result;
-    logic        s3_v;
-
-    shortreal sr_a, sr_b, sr_prod, sr_c, sr_sum;
+    // -----------------------------------------------------------------------
+    // Delay c_fp32 by 3 cycles to align with mul_result
+    // -----------------------------------------------------------------------
+    logic [31:0] c_dly [0:2];
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            s1_v <= 0; s2_v <= 0; s3_v <= 0;
-        end else if (en) begin
-            // Stage 1: latch; b decoded combinatorially above
-            s1_a <= a_fp32;
-            s1_b <= b_fp32;
-            s1_c <= c_fp32;
-            s1_v <= valid_in;
-
-            // Stage 2: FP32 × FP32 multiply
-            sr_a    = $bitstoshortreal(s1_a);
-            sr_b    = $bitstoshortreal(s1_b);
-            sr_prod = sr_a * sr_b;
-            s2_prod <= $shortrealtobits(sr_prod);
-            s2_c    <= s1_c;
-            s2_v    <= s1_v;
-
-            // Stage 3: accumulate
-            sr_prod = $bitstoshortreal(s2_prod);
-            sr_c    = $bitstoshortreal(s2_c);
-            sr_sum  = sr_prod + sr_c;
-            s3_result <= $shortrealtobits(sr_sum);
-            s3_v      <= s2_v;
+            c_dly[0] <= 32'h0;
+            c_dly[1] <= 32'h0;
+            c_dly[2] <= 32'h0;
+        end else begin
+            c_dly[0] <= c_fp32;
+            c_dly[1] <= c_dly[0];
+            c_dly[2] <= c_dly[1];
         end
     end
 
-    always_comb begin
-        result_fp32 = s3_result;
-        valid_out   = s3_v;
-    end
+    // -----------------------------------------------------------------------
+    // Stage 2: fp32_add — product + c_fp32_delayed, latency = 4 cycles
+    // -----------------------------------------------------------------------
+    fp32_add u_add (
+        .clk      (clk),
+        .rst      (rst),
+        .valid_in (mul_valid),
+        .a        (mul_result),
+        .b        (c_dly[2]),
+        .result   (result_fp32),
+        .valid_out(valid_out)
+    );
 
 endmodule
+
