@@ -1,4 +1,10 @@
-# neuro-fabric-fpga
+# neuro-fabric-fpga (archived)
+
+> **This repository is no longer maintained.**
+> The FPGA RTL has moved to [neuro-fabric](https://github.com/Binoculars-X/neuro-fabric) under `fpga/`.
+> All further development, issues, and PRs should go there.
+
+---
 
 Xilinx FPGA RTL implementation of the NeuronFabric Transformer training pipeline.
 
